@@ -1,0 +1,135 @@
+-- Forest on Baseplate (full-area placement, same density)
+
+local WK = game:GetService("Workspace")
+local RS = game:GetService("ReplicatedStorage")
+
+-- 1) Ensure baseplate for perfect alignment
+local base = WK:FindFirstChild("ForestBase")
+if not base then
+	base = Instance.new("Part")
+	base.Name = "ForestBase"
+	base.Anchored = true
+	base.Locked = true
+	base.Material = Enum.Material.Ground
+	base.Color = Color3.fromRGB(60, 60, 60)
+	base.Size = Vector3.new(2048, 2, 2048)
+	base.CFrame = CFrame.new(0, 0, 0)
+	base.Parent = WK
+end
+local baseTopY = base.Position.Y + base.Size.Y/2
+
+-- 2) Tree library
+local lib = RS:FindFirstChild("TreeLibrary")
+assert(lib, "Missing ReplicatedStorage/TreeLibrary")
+local models = {}
+for _, m in ipairs(lib:GetChildren()) do
+	if m:IsA("Model") then
+		table.insert(models, m)
+	end
+end
+assert(#models > 0, "TreeLibrary has no Model children")
+
+-- 3) Forest folder
+local forest = WK:FindFirstChild("Forest") or Instance.new("Folder")
+forest.Name = "Forest"
+forest.Parent = WK
+
+-- 4) Area and density
+local center = base.Position
+local halfX, halfZ = base.Size.X * 0.5, base.Size.Z * 0.5
+local rng = Random.new()
+local function noise2(x, z)
+	return math.noise(x * 0.035, z * 0.035)
+end
+
+-- Density settings (same “feel” as before)
+local BASE_TRIES_FOR_CIRCLE = 6000
+local DENSITY_MIN, DENSITY_MAX = 3.5, 4.5
+local MIN_SPACING = 2.2
+
+-- Lift above ground
+local EXTRA_LIFT = 9
+
+-- Compute tries to keep same density when expanding from circle to full rectangle
+local radius = math.min(base.Size.X, base.Size.Z) * 0.48
+local circleArea = math.pi * radius * radius
+local rectArea   = base.Size.X * base.Size.Z
+local areaScale  = rectArea / circleArea
+local NUM_TRIES  = math.floor(BASE_TRIES_FOR_CIRCLE * areaScale + 0.5)
+
+-- Small margin so we don’t place on the exact edge
+local EDGE_MARGIN = 2
+
+-- spacing helper
+local placed2D = {}
+local function farEnough(x, z)
+	for _, p in ipairs(placed2D) do
+		local dx = x - p.X
+		local dz = z - p.Z
+		if dx*dx + dz*dz < (MIN_SPACING * MIN_SPACING) then
+			return false
+		end
+	end
+	return true
+end
+
+-- 5) Placement loop (rectangle sampling across entire base)
+local placed = 0
+for i = 1, NUM_TRIES do
+	-- sample anywhere on the baseplate rectangle
+	local x = center.X + rng:NextNumber(-halfX + EDGE_MARGIN, halfX - EDGE_MARGIN)
+	local z = center.Z + rng:NextNumber(-halfZ + EDGE_MARGIN, halfZ - EDGE_MARGIN)
+
+	-- same noise-driven acceptance
+	local n = (noise2(x, z) + 1) * 0.5
+	local localDensity = DENSITY_MIN + (DENSITY_MAX - DENSITY_MIN) * n
+	if rng:NextNumber(0, DENSITY_MAX) > localDensity then
+		continue
+	end
+
+	if not farEnough(x, z) then
+		continue
+	end
+
+	local template = models[rng:NextInteger(1, #models)]
+	local tree = template:Clone()
+	tree.Parent = forest
+
+	local ref = tree:FindFirstChildWhichIsA("BasePart", true)
+	if not ref then
+		tree:Destroy()
+		continue
+	end
+
+	-- gentle random scale
+	if typeof(tree.ScaleTo) == "function" then
+		pcall(function()
+			tree:ScaleTo(rng:NextNumber(0.92, 1.18))
+		end)
+	end
+
+	local rotY = CFrame.Angles(0, math.rad(rng:NextNumber(0, 360)), 0)
+	local tilt = CFrame.Angles(math.rad(rng:NextNumber(-3, 3)), 0, math.rad(rng:NextNumber(-3, 3)))
+
+	local lift = (ref.Size and ref.Size.Y/2) or 2
+	local target = CFrame.new(x, baseTopY + lift + EXTRA_LIFT, z) * rotY * tilt
+
+	local prevPrimary = tree.PrimaryPart
+	tree.PrimaryPart = ref
+	tree:MoveTo(Vector3.new(x, baseTopY + lift + EXTRA_LIFT, z))
+	tree:PivotTo(target)
+	if prevPrimary then
+		tree.PrimaryPart = prevPrimary
+	end
+
+	for _, d in ipairs(tree:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = true
+		end
+	end
+
+	table.insert(placed2D, Vector3.new(x, 0, z))
+	placed += 1
+end
+
+print(("Forest generation complete: %d trees placed over full base, +%d studs lift"):format(placed, EXTRA_LIFT))
