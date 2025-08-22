@@ -1,0 +1,180 @@
+-- Perimeter "Log wall" builder (no gaps, raised 9 studs, all faces toward center)
+-- Assumptions:
+--   - Workspace has a rectangular base Part named "Baseplate" (change baseplateName if needed)
+--   - ReplicatedStorage contains a Part or Model named "Log wall"
+
+local RS = game:GetService("ReplicatedStorage")
+local WK = game:GetService("Workspace")
+
+local wallName = "Log wall"
+local baseplateName = "Baseplate"
+local heightOffset = 9 -- raise walls this many studs above the baseplate center
+
+local wallTemplate = RS:FindFirstChild(wallName)
+local baseplate = WK:FindFirstChild(baseplateName)
+
+if not wallTemplate then
+    warn("Could not find '"..wallName.."' in ReplicatedStorage.")
+    return
+end
+if not baseplate then
+    warn("Could not find '"..baseplateName.."' in Workspace.")
+    return
+end
+
+-- Folder for walls
+local wallFolder = WK:FindFirstChild("PerimeterWalls") or Instance.new("Folder", WK)
+wallFolder.Name = "PerimeterWalls"
+
+-- Base info
+local sizeX, sizeZ = baseplate.Size.X, baseplate.Size.Z
+local centerWorldCF = baseplate.CFrame * CFrame.new(0, heightOffset, 0) -- apply height offset
+local centerPos = centerWorldCF.Position
+local halfX, halfZ = sizeX/2, sizeZ/2
+
+-- Axes of the base (respect base rotation)
+local baseRight = baseplate.CFrame.RightVector      -- local +X
+local baseForward = baseplate.CFrame.LookVector     -- along local Z (note: LookVector points toward local -Z, but it's along the edge line which is fine)
+local worldUp = Vector3.new(0, 1, 0)
+
+-- Utilities
+local function anchorAllParts(root)
+    if root:IsA("BasePart") then
+        root.Anchored = true
+        return
+    end
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("BasePart") then
+            d.Anchored = true
+        end
+    end
+end
+
+local function getPrimary(root)
+    if root:IsA("Model") then
+        if not root.PrimaryPart then
+            local p = root:FindFirstChildWhichIsA("BasePart")
+            if p then root.PrimaryPart = p end
+        end
+        return root.PrimaryPart
+    elseif root:IsA("BasePart") then
+        return root
+    end
+end
+
+local function getLengthAlongLocalX(root)
+    if root:IsA("BasePart") then
+        return root.Size.X
+    else
+        local size = root:GetExtentsSize()
+        return size.X
+    end
+end
+
+-- Build an orientation frame whose -Z faces toward center, +X runs along the edge (tangent)
+local function makeSideFrame(sidePos, tangentDir)
+    local inwardDir = (centerPos - sidePos).Unit           -- points toward center
+    local rightDir = tangentDir.Unit                       -- along edge (length axis)
+    local upDir = worldUp
+    -- Ensure right is perpendicular to up and inward; re-orthogonalize for safety
+    rightDir = (upDir:Cross(inwardDir)).Unit
+    upDir = (inwardDir:Cross(rightDir)).Unit
+    local backDir = -inwardDir                             -- +Z (backVector)
+    -- CFrame.fromMatrix(pos, right, up, back)
+    return CFrame.fromMatrix(sidePos, rightDir, upDir, backDir)
+end
+
+local function cloneAndPlacePartSide(sideCF, length)
+    local clone = wallTemplate:Clone()
+    clone.Parent = wallFolder
+    anchorAllParts(clone)
+    if clone:IsA("BasePart") then
+        clone.Size = Vector3.new(length, clone.Size.Y, clone.Size.Z)
+        clone.CFrame = sideCF
+    else
+        local prim = getPrimary(clone)
+        if prim then clone:PivotTo(sideCF) end
+    end
+    return clone
+end
+
+local function cloneAndPlaceModelSegment(segCF)
+    local clone = wallTemplate:Clone()
+    clone.Parent = wallFolder
+    anchorAllParts(clone)
+    if clone:IsA("Model") then
+        getPrimary(clone)
+        clone:PivotTo(segCF)
+    else
+        clone.CFrame = segCF
+    end
+    return clone
+end
+
+-- If Part template: Stretch one piece per side (no gaps), oriented inward
+if wallTemplate:IsA("BasePart") then
+    -- Front (+Z): center at +Z, tangent along baseRight
+    do
+        local sidePos = (baseplate.CFrame * CFrame.new(0, heightOffset, halfZ)).Position
+        local sideCF = makeSideFrame(sidePos, baseRight)
+        cloneAndPlacePartSide(sideCF, sizeX)
+    end
+    -- Back (-Z)
+    do
+        local sidePos = (baseplate.CFrame * CFrame.new(0, heightOffset, -halfZ)).Position
+        local sideCF = makeSideFrame(sidePos, baseRight)
+        cloneAndPlacePartSide(sideCF, sizeX)
+    end
+    -- Right (+X): tangent along baseForward
+    do
+        local sidePos = (baseplate.CFrame * CFrame.new(halfX, heightOffset, 0)).Position
+        local sideCF = makeSideFrame(sidePos, baseForward)
+        cloneAndPlacePartSide(sideCF, sizeZ)
+    end
+    -- Left (-X)
+    do
+        local sidePos = (baseplate.CFrame * CFrame.new(-halfX, heightOffset, 0)).Position
+        local sideCF = makeSideFrame(sidePos, baseForward)
+        cloneAndPlacePartSide(sideCF, sizeZ)
+    end
+
+    print("Perimeter walls built (raised 9 studs, stretched parts, all facing center).")
+    return
+end
+
+-- Otherwise, tile Model segments (no gaps), oriented inward
+local tmp = wallTemplate:Clone()
+tmp.Parent = wallFolder
+anchorAllParts(tmp)
+local segLen = getLengthAlongLocalX(tmp)
+tmp:Destroy()
+
+if segLen <= 0 then
+    warn("Could not infer segment length of '"..wallName.."'.")
+    return
+end
+
+local tinyOverlap = 0.05
+
+local function tileSide(sideCenterPos, sideLength, tangentDir)
+    local sideCF = makeSideFrame(sideCenterPos, tangentDir) -- local X = tangent, -Z faces center
+    local n = math.ceil(sideLength / (segLen - tinyOverlap))
+    local step = sideLength / n
+    local startOffset = -sideLength/2 + step/2
+    for i = 0, n - 1 do
+        local offset = startOffset + i * step
+        local segCF = sideCF * CFrame.new(offset, 0, 0) -- move along local X
+        cloneAndPlaceModelSegment(segCF)
+    end
+end
+
+-- FRONT (+Z): tangent along baseRight
+tileSide((baseplate.CFrame * CFrame.new(0, heightOffset, halfZ)).Position, sizeX, baseRight)
+-- BACK (-Z)
+tileSide((baseplate.CFrame * CFrame.new(0, heightOffset, -halfZ)).Position, sizeX, baseRight)
+-- RIGHT (+X): tangent along baseForward
+tileSide((baseplate.CFrame * CFrame.new(halfX, heightOffset, 0)).Position, sizeZ, baseForward)
+-- LEFT (-X)
+tileSide((baseplate.CFrame * CFrame.new(-halfX, heightOffset, 0)).Position, sizeZ, baseForward)
+
+print("Perimeter walls built (raised 9 studs, tiled models, all facing center).")

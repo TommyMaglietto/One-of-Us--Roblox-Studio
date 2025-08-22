@@ -1,0 +1,85 @@
+-- Invisible No-Climb Perimeter Barrier (Inward 0.5 studs)
+-- Assumes a rectangular Part named "Baseplate" in Workspace
+
+local WK = game:GetService("Workspace")
+
+-- Settings
+local baseplateName = "Baseplate"
+local barrierHeight = 200         -- height of the barrier
+local barrierThickness = 2        -- thickness of the invisible wall
+local inwardOffset = 0.5          -- move barrier inward this much
+local overlapMargin = 4           -- extra length to avoid corner gaps
+local nameFolder = "Perimeter_NoClimbBarrier"
+
+-- Find base
+local base = WK:FindFirstChild(baseplateName)
+if not base or not base:IsA("BasePart") then
+    warn("Could not find a Part named '"..baseplateName.."' in Workspace")
+    return
+end
+
+-- Prepare folder
+local folder = WK:FindFirstChild(nameFolder)
+if folder then folder:Destroy() end
+folder = Instance.new("Folder")
+folder.Name = nameFolder
+folder.Parent = WK
+
+-- Base info
+local baseTopY = base.Position.Y + base.Size.Y / 2
+local barrierCenterY = baseTopY + barrierHeight / 2
+local halfX = base.Size.X / 2
+local halfZ = base.Size.Z / 2
+
+-- Utility to make barrier part
+local function makeBarrier(size, cframe, sideName)
+    local p = Instance.new("Part")
+    p.Name = "NoClimb_" .. sideName
+    p.Size = size
+    p.CFrame = cframe
+    p.Transparency = 1
+    p.Anchored = true
+    p.CanCollide = true
+    p.CanTouch = true
+    p.CanQuery = true
+    p.CastShadow = false
+    p.Locked = true
+    p.Material = Enum.Material.SmoothPlastic
+    p.TopSurface = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    p.Parent = folder
+end
+
+-- Front edge (positive Z)
+do
+    local length = base.Size.X + overlapMargin
+    local size = Vector3.new(length, barrierHeight, barrierThickness)
+    local pos = base.CFrame * CFrame.new(0, barrierCenterY - base.Position.Y, halfZ - inwardOffset)
+    makeBarrier(size, pos, "Front")
+end
+
+-- Back edge (negative Z)
+do
+    local length = base.Size.X + overlapMargin
+    local size = Vector3.new(length, barrierHeight, barrierThickness)
+    local pos = base.CFrame * CFrame.new(0, barrierCenterY - base.Position.Y, -halfZ + inwardOffset)
+    makeBarrier(size, pos, "Back")
+end
+
+-- Right edge (positive X)
+do
+    local length = base.Size.Z + overlapMargin
+    local size = Vector3.new(barrierThickness, barrierHeight, length)
+    local pos = base.CFrame * CFrame.new(halfX - inwardOffset, barrierCenterY - base.Position.Y, 0)
+    makeBarrier(size, pos, "Right")
+end
+
+-- Left edge (negative X)
+do
+    local length = base.Size.Z + overlapMargin
+    local size = Vector3.new(barrierThickness, barrierHeight, length)
+    local pos = base.CFrame * CFrame.new(-halfX + inwardOffset, barrierCenterY - base.Position.Y, 0)
+    makeBarrier(size, pos, "Left")
+end
+
+print("Invisible inward no-climb perimeter barrier created: " .. nameFolder)
