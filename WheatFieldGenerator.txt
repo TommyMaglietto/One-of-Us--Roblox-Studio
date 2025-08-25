@@ -1,0 +1,61 @@
+-- WheatSquare_Variation_Smaller.lua
+-- Paste into the Command Bar. Creates a 10x10 Wheat field with slight size reduction.
+
+local WK = game:GetService("Workspace")
+
+-- Find "Wheat" anywhere in Workspace (ignores capitalization)
+local function findInWorkspace(name)
+	for _, obj in ipairs(WK:GetDescendants()) do
+		if obj.Name:lower() == name:lower() then
+			return obj
+		end
+	end
+	return nil
+end
+
+local wheat = findInWorkspace("Wheat")
+if not wheat then
+	warn("Could not find 'Wheat' in Workspace!")
+	return
+end
+
+-- Settings
+local SIZE = 10
+local SPACING = 16 * 0.9      -- 10% less spacing
+local HEIGHT_VARIATION = Vector3.new(1, 2.7, 1) -- slightly reduced max height
+local OFFSET_RANGE = 3
+local ROTATION_VARIATION = 360
+
+-- Folder for generated farm
+local farmFolder = Instance.new("Folder")
+farmFolder.Name = "WheatFarm_Variation_Smaller"
+farmFolder.Parent = WK
+
+-- Base position (start at camera)
+local cam = WK.CurrentCamera
+local basePos = cam and cam.CFrame.Position or Vector3.new(0, 0, 0)
+
+-- Generate farm with variation
+for row = 1, SIZE do
+	for col = 1, SIZE do
+		local clone = wheat:Clone()
+
+		-- Base position with random offset
+		local pos = basePos + Vector3.new((col - 1) * SPACING, 0, (row - 1) * SPACING)
+		pos = pos + Vector3.new(math.random(-OFFSET_RANGE, OFFSET_RANGE), 0, math.random(-OFFSET_RANGE, OFFSET_RANGE))
+
+		-- Random rotation
+		local rotation = math.rad(math.random(0, ROTATION_VARIATION))
+		local cf = CFrame.new(pos) * CFrame.Angles(0, rotation, 0)
+
+		-- Random growth scaling (height)
+		local scaleFactor = math.random(HEIGHT_VARIATION.X * 10, HEIGHT_VARIATION.Y * 10) / 10
+		clone.Size = Vector3.new(clone.Size.X, clone.Size.Y * scaleFactor, clone.Size.Z)
+
+		-- Apply CFrame and parent to farm folder
+		clone.CFrame = cf
+		clone.Parent = farmFolder
+	end
+end
+
+print("Generated 10x10 Wheat field with 10% reduced spacing and height variation.")
