@@ -1,0 +1,25 @@
+-- ServerScriptService/PlankPromptSeeder.server.lua
+local PLANKS = workspace:WaitForChild("Planks")
+
+local function ensurePrompt(p)
+	if not p:IsA("BasePart") then return end
+	if p.Name ~= "Plank" then return end
+	if p:FindFirstChild("PickUpPlank") then return end
+	local pp = Instance.new("ProximityPrompt")
+	pp.Name = "PickUpPlank"
+	pp.ActionText = "Pick Up"
+	pp.ObjectText = "Plank"
+	pp.KeyboardKeyCode = Enum.KeyCode.E
+	pp.HoldDuration = 0
+	pp.RequiresLineOfSight = false
+	pp.MaxActivationDistance = 10
+	pp.Parent = p
+end
+
+for _, p in ipairs(PLANKS:GetChildren()) do
+	ensurePrompt(p)
+end
+
+PLANKS.ChildAdded:Connect(function(c)
+	task.defer(function() ensurePrompt(c) end)
+end)
