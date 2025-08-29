@@ -1,0 +1,15 @@
+local PLANKS = workspace:WaitForChild("Planks")
+for _, p in ipairs(PLANKS:GetChildren()) do
+	if p:IsA("BasePart") and p.Name == "Plank" and not p:FindFirstChild("PickUpPlank") then
+		local pp = Instance.new("ProximityPrompt")
+		pp.Name = "PickUpPlank"
+		pp.ActionText = "Pick Up"
+		pp.ObjectText = "Plank"
+		pp.KeyboardKeyCode = Enum.KeyCode.E
+		pp.HoldDuration = 0
+		pp.RequiresLineOfSight = false
+		pp.MaxActivationDistance = 10
+		pp.Parent = p
+	end
+end
+print("Proximity prompts added to existing planks.")
