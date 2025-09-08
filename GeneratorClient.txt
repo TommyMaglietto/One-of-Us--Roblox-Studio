@@ -1,0 +1,262 @@
+-- StarterPlayerScripts/GeneratorClient
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player      = Players.LocalPlayer
+local GenFolder   = ReplicatedStorage:WaitForChild("GenSystem")
+local Remotes     = GenFolder:WaitForChild("Remotes")
+local StartRepair = Remotes:WaitForChild("StartRepair")
+local StopRepair  = Remotes:WaitForChild("StopRepair")
+local GenProgress = Remotes:WaitForChild("GenProgress")
+local QTEPrompt   = Remotes:WaitForChild("QTEPrompt")
+local QTEResult   = Remotes:WaitForChild("QTEResult")
+
+-- === UI ===
+local gui = Instance.new("ScreenGui")
+gui.Name = "GenUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local progressFrame = Instance.new("Frame")
+progressFrame.Size = UDim2.new(0, 420, 0, 40)
+progressFrame.Position = UDim2.new(0.5, -210, 1, -120)
+progressFrame.BackgroundColor3 = Color3.fromRGB(25,25,25)
+progressFrame.BackgroundTransparency = 0.2
+progressFrame.Visible = false
+progressFrame.Parent = gui
+Instance.new("UICorner", progressFrame).CornerRadius = UDim.new(0, 8)
+
+local barBg = Instance.new("Frame")
+barBg.Size = UDim2.new(1, -20, 1, -20)
+barBg.Position = UDim2.new(0,10,0,10)
+barBg.BackgroundColor3 = Color3.fromRGB(50,50,50)
+barBg.Parent = progressFrame
+Instance.new("UICorner", barBg).CornerRadius = UDim.new(0, 6)
+
+local barFill = Instance.new("Frame")
+barFill.Size = UDim2.new(0, 0, 1, 0)
+barFill.BackgroundColor3 = Color3.fromRGB(0,170,255)
+barFill.Parent = barBg
+Instance.new("UICorner", barFill).CornerRadius = UDim.new(0, 6)
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(1, 0, 1, 0)
+label.BackgroundTransparency = 1
+label.Text = "Repairing 0%"
+label.TextScaled = true
+label.Font = Enum.Font.GothamBold
+label.TextColor3 = Color3.fromRGB(235,235,235)
+label.Parent = progressFrame
+
+local qteRoot = Instance.new("Frame")
+qteRoot.Size = UDim2.new(0, 420, 0, 110)
+qteRoot.Position = UDim2.new(0.5, -210, 1, -220)
+qteRoot.BackgroundColor3 = Color3.fromRGB(25,25,25)
+qteRoot.Visible = false
+qteRoot.Parent = gui
+Instance.new("UICorner", qteRoot).CornerRadius = UDim.new(0, 8)
+
+local qteMsg = Instance.new("TextLabel")
+qteMsg.Size = UDim2.new(1, 0, 0, 22)
+qteMsg.Position = UDim2.new(0, 0, 0, 8)
+qteMsg.BackgroundTransparency = 1
+qteMsg.Text = "Press F (or button) in the green!"
+qteMsg.TextColor3 = Color3.fromRGB(230,230,230)
+qteMsg.Font = Enum.Font.GothamBold
+qteMsg.TextScaled = true
+qteMsg.Parent = qteRoot
+
+local qteBar = Instance.new("Frame")
+qteBar.Size = UDim2.new(1, -20, 0, 16)
+qteBar.Position = UDim2.new(0,10,0, 38)
+qteBar.BackgroundColor3 = Color3.fromRGB(60,60,60)
+qteBar.Parent = qteRoot
+Instance.new("UICorner", qteBar).CornerRadius = UDim.new(0, 8)
+
+local qteZone = Instance.new("Frame")
+qteZone.BackgroundColor3 = Color3.fromRGB(0,255,170)
+qteZone.Size = UDim2.new(0.2, 0, 1, 0)
+qteZone.AnchorPoint = Vector2.new(0.5,0.5)
+qteZone.Position = UDim2.new(0.5,0,0.5,0)
+qteZone.BackgroundTransparency = 0.3
+qteZone.Parent = qteBar
+Instance.new("UICorner", qteZone).CornerRadius = UDim.new(0, 8)
+
+local qteMarker = Instance.new("Frame")
+qteMarker.Size = UDim2.new(0,6, 1.6,0)
+qteMarker.BackgroundColor3 = Color3.fromRGB(255,255,255)
+qteMarker.BorderSizePixel = 0
+qteMarker.Position = UDim2.new(0,0,0.5,-5)
+qteMarker.Parent = qteBar
+
+-- Big button for mobile/PC (same as pressing F)
+local qteButton = Instance.new("TextButton")
+qteButton.Size = UDim2.new(0, 180, 0, 36)
+qteButton.Position = UDim2.new(0.5, -90, 1, -46)
+qteButton.Text = "PRESS"
+qteButton.TextScaled = true
+qteButton.Font = Enum.Font.GothamBold
+qteButton.TextColor3 = Color3.fromRGB(20,20,20)
+qteButton.BackgroundColor3 = Color3.fromRGB(0, 255, 170)
+qteButton.Parent = qteRoot
+Instance.new("UICorner", qteButton).CornerRadius = UDim.new(0, 8)
+
+-- === State ===
+local activeGenerator : Model? = nil
+local inRepair = false
+local currentQTE = nil
+local qteConn = nil
+
+-- distance cutoff (studs) to auto-stop & hide UI
+local MAX_DIST = 12
+
+local function getCharPos()
+	local char = player.Character
+	if not char then return nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	return hrp and hrp.Position or nil
+end
+
+local function stopRepairing()
+	if inRepair and activeGenerator then
+		StopRepair:FireServer(activeGenerator)
+	end
+	inRepair = false
+	activeGenerator = nil
+	progressFrame.Visible = false
+	qteRoot.Visible = false
+	if qteConn then qteConn:Disconnect() qteConn = nil end
+	currentQTE = nil
+end
+
+-- Toggle via ProximityPrompt (set HoldDuration=0 on the prompt)
+local function hookPrompt(prompt)
+	if not prompt or not prompt:IsA("ProximityPrompt") then return end
+	prompt.Triggered:Connect(function()
+		local gen = prompt.Parent and prompt.Parent.Parent
+		if not gen then return end
+		if not inRepair then
+			inRepair = true
+			activeGenerator = gen
+			StartRepair:FireServer(gen)
+			progressFrame.Visible = true
+		else
+			stopRepairing()
+		end
+	end)
+	-- Auto-hide UI when prompt goes out of range/hidden
+	prompt.PromptHidden:Connect(function()
+		if inRepair then
+			stopRepairing()
+		end
+	end)
+end
+
+for _, obj in ipairs(workspace:GetDescendants()) do
+	if obj:IsA("ProximityPrompt") and obj.Parent and obj.Parent.Name == "UsePart" then
+		hookPrompt(obj)
+	end
+end
+workspace.DescendantAdded:Connect(function(obj)
+	if obj:IsA("ProximityPrompt") and obj.Parent and obj.Parent.Name == "UsePart" then
+		hookPrompt(obj)
+	end
+end)
+
+-- Extra safety: distance watcher
+RunService.Heartbeat:Connect(function()
+	if not inRepair or not activeGenerator or not activeGenerator.PrimaryPart then return end
+	local p = getCharPos()
+	if not p then return end
+	local d = (p - activeGenerator.PrimaryPart.Position).Magnitude
+	if d > MAX_DIST then
+		stopRepairing()
+	end
+end)
+
+-- Progress UI
+GenProgress.OnClientEvent:Connect(function(genModel, progress, maxProgress, status)
+	if activeGenerator ~= genModel then return end
+	if status == "full" then
+		label.Text = "Generator busy"
+		return
+	end
+	local pct = math.floor((progress / maxProgress) * 100 + 0.5)
+	label.Text = "Repairing " .. pct .. "%"
+	barFill.Size = UDim2.new(progress / maxProgress, 0, 1, 0)
+	if pct >= 100 then
+		label.Text = "Repaired"
+		task.delay(0.5, stopRepairing)
+	end
+end)
+
+-- QTE prompt
+QTEPrompt.OnClientEvent:Connect(function(genModel, data)
+	if activeGenerator ~= genModel then return end
+	-- If one is already active, ignore (server also prevents overlap)
+	if currentQTE then return end
+
+	if qteConn then qteConn:Disconnect() qteConn = nil end
+	currentQTE = {
+		id = data.id,
+		duration = data.duration,
+		zoneCenter = data.zoneCenter,
+		zoneWidth = data.zoneWidth,
+		startTime = time(),
+	}
+
+	qteRoot.Visible = true
+	qteZone.Size = UDim2.new(currentQTE.zoneWidth, 0, 1, 0)
+	qteZone.Position = UDim2.new(currentQTE.zoneCenter, 0, 0.5, 0)
+
+	qteConn = RunService.RenderStepped:Connect(function()
+		if not currentQTE then
+			if qteConn then qteConn:Disconnect() qteConn = nil end
+			return
+		end
+		local t = (time() - currentQTE.startTime) / currentQTE.duration
+		if t >= 1 then
+			-- timeout -> fail
+			if qteConn then qteConn:Disconnect() qteConn = nil end
+			qteRoot.Visible = false
+			QTEResult:FireServer(activeGenerator, { id = currentQTE.id, success = false })
+			currentQTE = nil
+			return
+		end
+		qteMarker.Position = UDim2.new(t, -3, 0.5, -5)
+	end)
+end)
+
+-- Time-based success (button + F use this)
+local function attemptQTE()
+	if not currentQTE or not activeGenerator then return end
+
+	-- Where we are in the sweep (0..1)
+	local tfrac = math.clamp((time() - currentQTE.startTime) / currentQTE.duration, 0, 1)
+
+	-- Hit window with tiny leniency (good for mobile)
+	local center   = currentQTE.zoneCenter
+	local half     = currentQTE.zoneWidth * 0.5
+	local leniency = 0.03
+	local success  = (tfrac >= (center - half - leniency)) and (tfrac <= (center + half + leniency))
+
+	QTEResult:FireServer(activeGenerator, { id = currentQTE.id, success = success })
+
+	if qteConn then qteConn:Disconnect() qteConn = nil end
+	currentQTE = nil
+	qteRoot.Visible = false
+end
+
+-- Big button (mobile/PC)
+qteButton.MouseButton1Click:Connect(attemptQTE)
+
+-- Keyboard F to complete QTE
+UserInputService.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.F then
+		attemptQTE()
+	end
+end)
