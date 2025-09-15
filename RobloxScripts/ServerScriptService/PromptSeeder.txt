@@ -1,0 +1,87 @@
+-- ServerScriptService/InventoryPlanks.server.lua
+-- Keeps a non-selectable "Planks xN" tool and increments it when collecting
+local Players = game:GetService("Players")
+local PPS = game:GetService("ProximityPromptService")
+
+local TOOL_BASE = "Planks"       -- base display name
+local TOOL_ICON = ""             -- optional e.g. "rbxassetid://12345"
+
+local function ensureInventory(plr)
+	local inv = plr:FindFirstChild("Inventory")
+	if not inv then
+		inv = Instance.new("Folder")
+		inv.Name = "Inventory"
+		inv.Parent = plr
+	end
+	local count = inv:FindFirstChild("PlankCount")
+	if not count then
+		count = Instance.new("IntValue")
+		count.Name = "PlankCount"
+		count.Value = 0
+		count.Parent = inv
+	end
+	return inv, count
+end
+
+local function getOrMakeTool(container)
+	for _, t in ipairs(container:GetChildren()) do
+		if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then
+			return t
+		end
+	end
+	local tool = Instance.new("Tool")
+	tool.RequiresHandle = false
+	tool.CanBeDropped = false
+	tool.ManualActivationOnly = true -- we also block equip on client
+	if TOOL_ICON ~= "" then tool.TextureId = TOOL_ICON end
+	tool.Name = TOOL_BASE.." x0"
+	tool.Parent = container
+	return tool
+end
+
+local function updateTool(plr, countVal)
+	local bp = plr:FindFirstChildOfClass("Backpack")
+	if bp then
+		local t = getOrMakeTool(bp)
+		t.Name = string.format("%s x%d", TOOL_BASE, countVal)
+	end
+	local sg = plr:FindFirstChild("StarterGear")
+	if sg then
+		local t2 = getOrMakeTool(sg)
+		t2.Name = string.format("%s x%d", TOOL_BASE, countVal)
+	end
+	if countVal <= 0 then
+		-- remove the tool when zero
+		if bp then
+			for _, t in ipairs(bp:GetChildren()) do
+				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
+			end
+		end
+		local sg2 = plr:FindFirstChild("StarterGear")
+		if sg2 then
+			for _, t in ipairs(sg2:GetChildren()) do
+				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
+			end
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	local _, count = ensureInventory(plr)
+	count:GetPropertyChangedSignal("Value"):Connect(function()
+		updateTool(plr, count.Value)
+	end)
+end)
+
+-- Collect: E on a Plank -> +1 count, delete world plank
+PPS.PromptTriggered:Connect(function(prompt, plr)
+	if prompt.Name ~= "PickUpPlank" then return end
+	local part = prompt.Parent
+	if not part or not part:IsA("BasePart") or part.Name ~= "Plank" then return end
+
+	local _, count = ensureInventory(plr)
+	count.Value += 1
+	updateTool(plr, count.Value)
+
+	part:Destroy()
+end)

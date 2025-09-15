@@ -1,0 +1,61 @@
+-- ServerScriptService/PromptSeeder.server.lua
+-- Adds Collect prompts to Workspace.Planks and Place prompts to Workspace.AOI.Bridge.Placeholders
+
+local WK = workspace
+local AOI = WK:WaitForChild("AOI")
+local BRIDGE = AOI:WaitForChild("Bridge")
+local PLACEHOLDERS = BRIDGE:WaitForChild("Placeholders")
+local PLANKS = WK:WaitForChild("Planks")
+
+local function ensureCollectPrompt(plank)
+	if not plank:IsA("BasePart") or plank.Name ~= "Plank" then return end
+	if plank:FindFirstChild("PickUpPlank") then return end
+	local pp = Instance.new("ProximityPrompt")
+	pp.Name = "PickUpPlank"
+	pp.ActionText = "Collect"
+	pp.ObjectText = "Plank"
+	pp.KeyboardKeyCode = Enum.KeyCode.E
+	pp.HoldDuration = 1
+	pp.RequiresLineOfSight = true
+	pp.MaxActivationDistance = 35
+	pp.Parent = plank
+end
+
+local function ensurePlacePrompt(slot)
+	if not slot:IsA("BasePart") then return end
+	slot.Name = "PlankPlaceholder"
+	slot.Anchored = true
+	slot.CanCollide = false
+	slot.Transparency = 1
+
+	if not slot:FindFirstChild("Occupied") then
+		local b = Instance.new("BoolValue")
+		b.Name = "Occupied"
+		b.Value = false
+		b.Parent = slot
+	end
+
+	if not slot:FindFirstChild("Snap") then
+		local a = Instance.new("Attachment")
+		a.Name = "Snap"
+		a.Parent = slot
+	end
+
+	if not slot:FindFirstChild("PlacePlankHere") then
+		local pp = Instance.new("ProximityPrompt")
+		pp.Name = "PlacePlankHere"
+		pp.ActionText = "Place"
+		pp.ObjectText = "Bridge Slot"
+		pp.KeyboardKeyCode = Enum.KeyCode.E
+		pp.HoldDuration = 1
+		pp.RequiresLineOfSight = false
+		pp.MaxActivationDistance = 40
+		pp.Parent = slot
+	end
+end
+
+for _, p in ipairs(PLANKS:GetChildren()) do ensureCollectPrompt(p) end
+PLANKS.ChildAdded:Connect(function(c) task.defer(function() ensureCollectPrompt(c) end) end)
+
+for _, s in ipairs(PLACEHOLDERS:GetChildren()) do ensurePlacePrompt(s) end
+PLACEHOLDERS.ChildAdded:Connect(function(c) task.defer(function() ensurePlacePrompt(c) end) end)
