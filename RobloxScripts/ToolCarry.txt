@@ -1,0 +1,83 @@
+local RunService = game:GetService("RunService")
+
+local viewModelsFolder = game.ReplicatedStorage.ViewModels
+
+local camera = game.Workspace.CurrentCamera
+
+local player = game.Players.LocalPlayer
+local char = player.Character or player.CharacterAdded:Wait()
+
+-------------- settings -----------------------
+
+--are on the models, in the Configuration in the ViewModels folder (ReplicatedStorage)
+
+local smooth = 30
+
+local bobSpeed = .5
+local bobDistance = .1
+local bobWalkMulti = 3
+local walkVeloThreshold = 9
+
+local swaySpeed = 1.1
+local swayDistance = .07
+local swayWalkMulti = 2
+
+-----------------------------------------------
+
+local tool = nil
+local viewModel = nil
+
+local targetCFrame = CFrame.new()
+
+function GetTargetCFrame()
+	local bobPos 
+	local swayPos
+	if char.PrimaryPart.AssemblyLinearVelocity.Magnitude >= walkVeloThreshold then
+		bobPos = math.sin(tick() * (bobSpeed * bobWalkMulti)) * bobDistance
+		swayPos = math.sin(tick() * (swaySpeed * swayWalkMulti)) * swayDistance
+	else
+		bobPos = math.sin(tick() * bobSpeed) * bobDistance 
+		swayPos = math.sin(tick() * swaySpeed) * swayDistance
+	end
+
+	return camera.CFrame * viewModel.Configuration:GetAttribute("OffsetCF") + Vector3.new(0, bobPos, swayPos)
+end
+
+char.DescendantAdded:Connect(function(t)
+	--checking for a tool to be added to the plr
+
+	if t:IsA("Tool") and t ~= nil then
+
+		tool = t
+		viewModel = viewModelsFolder[tool.Name]:Clone()
+		viewModel.Parent = camera
+		viewModel.Name = viewModel.Name .. " viewmodel"
+		--set the inital position for the viewmodel
+		viewModel.PrimaryPart:PivotTo(GetTargetCFrame() * CFrame.new(0, -2, 0))
+
+		for _, p in ipairs(t:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.LocalTransparencyModifier = 1
+
+			elseif p:IsA("SurfaceLight") then
+				p.Brightness = 0
+			end
+		end
+	end
+end)
+
+char.DescendantRemoving:Connect(function(t)
+	if t == tool then
+		tool = nil
+		viewModel:Destroy()
+		viewModel = nil
+	end
+end)
+
+RunService.RenderStepped:Connect(function(deltaTime)
+	if viewModel then
+		targetCFrame = GetTargetCFrame()
+
+		viewModel.PrimaryPart.CFrame = viewModel.PrimaryPart.CFrame:Lerp(targetCFrame, deltaTime * smooth)
+	end
+end)

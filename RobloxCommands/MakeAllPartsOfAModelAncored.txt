@@ -1,0 +1,1 @@
+for _, obj in ipairs(game.Selection:Get()[1]:GetDescendants()) do 	if obj:IsA("BasePart") then 		obj.Anchored = true 	end end 

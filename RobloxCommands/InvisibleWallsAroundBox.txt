@@ -1,0 +1,42 @@
+local WK = workspace
+local areaPart = WK:FindFirstChild("PerimeterArea")
+
+if not areaPart then
+	warn("Need a Part named 'PerimeterArea' in Workspace")
+	return
+end
+
+local out = WK:FindFirstChild("InvisibleWalls") or Instance.new("Folder", WK)
+out.Name = "InvisibleWalls"
+out:ClearAllChildren()
+
+-- dimensions
+local cf = areaPart.CFrame
+local sz = areaPart.Size
+local wallHeight = 50 -- how tall you want the invisible barrier
+local wallThickness = 1 -- thin wall
+
+local function makeWall(cframe, size)
+	local wall = Instance.new("Part")
+	wall.Anchored = true
+	wall.CanCollide = true
+	wall.Transparency = 1 -- invisible
+	wall.Size = size
+	wall.CFrame = cframe
+	wall.Name = "InvisibleWall"
+	wall.Parent = out
+end
+
+-- Top wall
+makeWall(cf * CFrame.new(0, wallHeight/2, -sz.Z/2), Vector3.new(sz.X, wallHeight, wallThickness))
+
+-- Bottom wall
+makeWall(cf * CFrame.new(0, wallHeight/2, sz.Z/2), Vector3.new(sz.X, wallHeight, wallThickness))
+
+-- Left wall
+makeWall(cf * CFrame.new(-sz.X/2, wallHeight/2, 0), Vector3.new(wallThickness, wallHeight, sz.Z))
+
+-- Right wall
+makeWall(cf * CFrame.new(sz.X/2, wallHeight/2, 0), Vector3.new(wallThickness, wallHeight, sz.Z))
+
+print("Invisible perimeter walls built")

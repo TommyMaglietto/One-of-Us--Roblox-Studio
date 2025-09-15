@@ -1,0 +1,55 @@
+local WK = workspace
+local areaPart = WK:FindFirstChild("PerimeterArea")
+local template = WK:FindFirstChild("Log wall") or game.ReplicatedStorage:FindFirstChild("Log wall")
+
+if not areaPart or not template then
+	warn("Need a Part named 'PerimeterArea' and a Model named 'Log wall'")
+	return
+end
+
+local out = WK:FindFirstChild("LogWallPerimeter") or Instance.new("Folder", WK)
+out.Name = "LogWallPerimeter"
+out:ClearAllChildren()
+
+-- measure template
+local function getSize(model)
+	local _, size = model:GetBoundingBox()
+	return size
+end
+
+local size = getSize(template)
+local pieceLen = math.max(size.X, size.Z)
+local pieceHei = size.Y
+
+local cf = areaPart.CFrame
+local sz = areaPart.Size
+local y = sz.Y * 0.5 + pieceHei * 0.5
+
+-- place a row of walls along an edge, with rotation
+local function placeEdge(startCF, direction, totalLen, rotation)
+	local n = math.max(1, math.floor(totalLen / pieceLen))
+	for i = 0, n - 1 do
+		local clone = template:Clone()
+		clone.Parent = out
+		local offset = -totalLen * 0.5 + pieceLen * 0.5 + i * pieceLen
+		local pos = startCF * CFrame.new(direction.X * offset, 0, direction.Z * offset) * rotation
+		clone:PivotTo(pos)
+		for _, d in ipairs(clone:GetDescendants()) do
+			if d:IsA("BasePart") then d.Anchored = true end
+		end
+	end
+end
+
+-- Top edge (runs along X, face outward -Z)
+placeEdge(cf * CFrame.new(0, y, -sz.Z * 0.5), Vector3.new(1,0,0), sz.X, CFrame.Angles(0, math.rad(180), 0))
+
+-- Bottom edge (runs along X, face outward +Z)
+placeEdge(cf * CFrame.new(0, y, sz.Z * 0.5), Vector3.new(1,0,0), sz.X, CFrame.new())
+
+-- Left edge (runs along Z, face outward -X)
+placeEdge(cf * CFrame.new(-sz.X * 0.5, y, 0), Vector3.new(0,0,1), sz.Z, CFrame.Angles(0, math.rad(-90), 0))
+
+-- Right edge (runs along Z, face outward +X)
+placeEdge(cf * CFrame.new(sz.X * 0.5, y, 0), Vector3.new(0,0,1), sz.Z, CFrame.Angles(0, math.rad(90), 0))
+
+print("Perimeter built with Log wall models, all facing outward")
