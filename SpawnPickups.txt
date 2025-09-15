@@ -1,0 +1,282 @@
+-- ServerScriptService/SpawnPickupsOnStumps.server.lua
+-- Keys: exactly 5 random stumps get a Key
+-- Remaining stumps: 9Volt 40%, Ammo 20%, None 30%
+-- Placement: centered on stump top, upright, collision-aware lifting
+-- Tweaks: Ammo is lowered by 0.229 studs; optional stump Attachment "PlaceHere" for exact centering
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local STUMPS_FOLDER = Workspace:WaitForChild("Stumps")
+local PICKUPS_SOURCE = ReplicatedStorage:WaitForChild("PickUps")
+
+local DEST_FOLDER = Workspace:FindFirstChild("SpawnedPickUps") or Instance.new("Folder")
+DEST_FOLDER.Name = "SpawnedPickUps"
+DEST_FOLDER.Parent = Workspace
+
+-- RNG variety per server
+do
+	math.randomseed(tick() % 1e6)
+	for _ = 1, 5 do math.random() end
+end
+
+-- Non-key outcomes for the "other" stumps
+local NON_KEY_RANGES = {
+	{ name = "9Volt", low = 1,  high = 40 },
+	{ name = "Ammo",  low = 41, high = 60 },
+	{ name = "None",  low = 61, high = 100 },
+}
+
+-- Per-item placement offsets (local to the item, applied after centering)
+-- Positive Y raises, negative Y lowers
+local ITEM_OFFSETS = {
+	Ammo = Vector3.new(0, -0.229, 0), -- lower the ammo box as requested
+	-- Key  = Vector3.new(0, 0, 0),
+	-- ["9Volt"] = Vector3.new(0, 0, 0),
+}
+
+-- Placement tuning
+local CLEARANCE_Y     = 0.05
+local MAX_LIFT_TRIES  = 10
+local LIFT_STEP       = 0.15
+local ADD_RANDOM_YAW  = true
+
+-- If present on a stump (anywhere under it), this Attachment's WorldCFrame determines the XZ center.
+-- We still keep the item upright and compute Y so it "rests" on the surface.
+local STUMP_MARKER_NAME = "PlaceHere"
+
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+
+---------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------
+
+local function getAnyBasePart(instance)
+	if instance:IsA("BasePart") then return instance end
+	for _, d in ipairs(instance:GetDescendants()) do
+		if d:IsA("BasePart") then return d end
+	end
+	return nil
+end
+
+local function ensurePrimaryPart(model)
+	if not model or not model:IsA("Model") then return nil end
+	if model.PrimaryPart and model.PrimaryPart.Parent == model then
+		return model.PrimaryPart
+	end
+	local part = getAnyBasePart(model)
+	if part then
+		model.PrimaryPart = part
+		return part
+	end
+	return nil
+end
+
+-- Highest top surface among parts in the stump
+local function getStumpTopPart(stump)
+	if stump:IsA("BasePart") then return stump end
+	local topPart, topY = nil, -math.huge
+	for _, p in ipairs(stump:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local thisTop = p.Position.Y + p.Size.Y * 0.5
+			if thisTop > topY then
+				topY = thisTop
+				topPart = p
+			end
+		end
+	end
+	return topPart
+end
+
+-- Optional precision centering: Attachment named PlaceHere anywhere under stump
+local function findStumpMarker(stump)
+	if stump:IsA("Attachment") and stump.Name == STUMP_MARKER_NAME then
+		return stump
+	end
+	if stump:IsA("BasePart") or stump:IsA("Model") then
+		return stump:FindFirstChild(STUMP_MARKER_NAME, true)
+	end
+	return nil
+end
+
+-- Build an upright CFrame centered over the stump's top.
+-- If a "PlaceHere" Attachment exists, use its XZ for centering.
+local function buildTargetCFrame(stump, itemModel)
+	local yawDegrees = ADD_RANDOM_YAW and math.random(0, 359) or 0
+	local yaw = CFrame.Angles(0, math.rad(yawDegrees), 0)
+
+	local _, itemSize = itemModel:GetBoundingBox()
+
+	-- Prefer artist marker if present
+	local marker = findStumpMarker(stump)
+	if marker and marker:IsA("Attachment") then
+		local posXZ = marker.WorldPosition
+		-- Compute surface top Y from the nearest top surface we know about
+		local topPart = getStumpTopPart(stump)
+		if topPart then
+			local topY = topPart.Position.Y + topPart.Size.Y * 0.5
+			local pos = Vector3.new(posXZ.X, topY + itemSize.Y * 0.5 + CLEARANCE_Y, posXZ.Z)
+			return CFrame.new(pos) * yaw
+		else
+			-- Fallback: rest on marker Y even without topPart, still keep upright
+			local pos = Vector3.new(posXZ.X, posXZ.Y + itemSize.Y * 0.5 + CLEARANCE_Y, posXZ.Z)
+			return CFrame.new(pos) * yaw
+		end
+	end
+
+	-- Auto centering: use the highest BasePart top center
+	local topPart = getStumpTopPart(stump)
+	if topPart then
+		local topY = topPart.Position.Y + topPart.Size.Y * 0.5
+		local pos = Vector3.new(topPart.Position.X, topY + itemSize.Y * 0.5 + CLEARANCE_Y, topPart.Position.Z)
+		return CFrame.new(pos) * yaw
+	end
+
+	-- Bounding-box fallback
+	if stump:IsA("Model") then
+		local stumpCF, stumpSize = stump:GetBoundingBox()
+		local y = stumpCF.Position.Y + stumpSize.Y * 0.5 + itemSize.Y * 0.5 + CLEARANCE_Y
+		return CFrame.new(Vector3.new(stumpCF.Position.X, y, stumpCF.Position.Z)) * yaw
+	elseif stump:IsA("BasePart") then
+		local y = stump.Position.Y + stump.Size.Y * 0.5 + itemSize.Y * 0.5 + CLEARANCE_Y
+		return CFrame.new(Vector3.new(stump.Position.X, y, stump.Position.Z)) * yaw
+	end
+
+	return CFrame.new(0, itemSize.Y, 0) * yaw
+end
+
+-- Check overlap at a proposed placement
+local function isOverlappingAtCF(targetCF, itemModel, ignoreList)
+	local _, size = itemModel:GetBoundingBox()
+	overlapParams.FilterDescendantsInstances = ignoreList
+	local hits = workspace:GetPartBoundsInBox(targetCF, size, overlapParams)
+	return (#hits > 0)
+end
+
+-- Lift slightly until not intersecting
+local function safePivotTo(clone, baseCF, stump)
+	local ignoreList = { clone }
+	if stump then table.insert(ignoreList, stump) end
+
+	local cf = baseCF
+	for _ = 1, MAX_LIFT_TRIES do
+		if not isOverlappingAtCF(cf, clone, ignoreList) then
+			clone:PivotTo(cf)
+			return true
+		end
+		cf = cf + Vector3.new(0, LIFT_STEP, 0)
+	end
+	clone:PivotTo(cf)
+	warn(("Pickup %s placed but still intersecting after max lifts"):format(clone.Name))
+	return false
+end
+
+-- Build final CF with per-item offset (Ammo lowered 0.229)
+local function applyItemOffset(baseCF, itemName)
+	local offset = ITEM_OFFSETS[itemName]
+	if offset then
+		return baseCF * CFrame.new(offset)
+	end
+	return baseCF
+end
+
+-- Place a specific item on a stump with all the rules
+local function placePickupOnStump(itemName, stump)
+	local src = PICKUPS_SOURCE:FindFirstChild(itemName)
+	if not src then
+		warn(("PickUp %s not found under ReplicatedStorage.PickUps"):format(itemName))
+		return
+	end
+
+	local clone = src:Clone()
+	clone.Parent = DEST_FOLDER
+
+	if clone:IsA("Model") then ensurePrimaryPart(clone) end
+
+	local baseCF = buildTargetCFrame(stump, clone)
+	local finalCF = applyItemOffset(baseCF, itemName) -- e.g., Ammo lowered here
+	safePivotTo(clone, finalCF, stump)
+end
+
+local function pickNonKeyOutcome()
+	local roll = math.random(1, 100)
+	for _, r in ipairs(NON_KEY_RANGES) do
+		if roll >= r.low and roll <= r.high then
+			return r.name
+		end
+	end
+	return "None"
+end
+
+---------------------------------------------------------------------
+-- Key selection and spawning flow
+---------------------------------------------------------------------
+
+local function shuffle(a)
+	for i = #a, 2, -1 do
+		local j = math.random(1, i)
+		a[i], a[j] = a[j], a[i]
+	end
+	return a
+end
+
+local function chooseKeyStumps(allStumps, keysToPlace)
+	local filtered = {}
+	for _, s in ipairs(allStumps) do
+		if s:IsA("Model") or s:IsA("BasePart") then
+			table.insert(filtered, s)
+		end
+	end
+	if #filtered == 0 then return {}, {} end
+	shuffle(filtered)
+	local nKeys = math.clamp(keysToPlace, 0, #filtered)
+	local keyStumps, otherStumps = {}, {}
+	for i, stump in ipairs(filtered) do
+		if i <= nKeys then
+			table.insert(keyStumps, stump)
+		else
+			table.insert(otherStumps, stump)
+		end
+	end
+	return keyStumps, otherStumps
+end
+
+---------------------------------------------------------------------
+-- Main
+---------------------------------------------------------------------
+
+local KEYS_TO_PLACE = 5
+local placedKeys = 0
+
+-- Snapshot current stumps
+local initialStumps = STUMPS_FOLDER:GetChildren()
+local keyStumps, otherStumps = chooseKeyStumps(initialStumps, KEYS_TO_PLACE)
+
+-- Place Keys first
+for _, stump in ipairs(keyStumps) do
+	placePickupOnStump("Key", stump)
+	placedKeys += 1
+end
+
+-- Then roll on the rest
+for _, stump in ipairs(otherStumps) do
+	local outcome = pickNonKeyOutcome()
+	if outcome ~= "None" then
+		placePickupOnStump(outcome, stump)
+	end
+end
+
+-- Handle stumps added later
+STUMPS_FOLDER.ChildAdded:Connect(function(child)
+	task.wait(0.1)
+	if placedKeys < KEYS_TO_PLACE then
+		placePickupOnStump("Key", child)
+		placedKeys += 1
+		return
+	end
+	local outcome = pickNonKeyOutcome()
+	if outcome ~= "None" then
+		placePickupOnStump(outcome, child)
+	end
+end)
