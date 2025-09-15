@@ -1,0 +1,211 @@
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local AOI_FOLDER_NAME = "AOI"
+local BUNKER_NAME = "Bunker"
+local SPAWN_FOLDER_NAME = "BunkerSpawns"
+local CUTTERS_FOLDER_NAME = "TerrainCutters"
+local DEFAULT_YAW_OFFSET_DEG = 0
+local EXTRA_CARVE_MARGIN_Y = 0
+local TERRAIN = Workspace.Terrain
+
+-- Returns the AOI folder under the given container or nil
+local function getAOI(container)
+	return container and container:FindFirstChild(AOI_FOLDER_NAME) or nil
+end
+
+-- Returns a comma separated list of child names and classes  helpful for quick prints
+local function listChildren(container)
+	if not container then return "nil" end
+	local t = {}
+	for _, c in ipairs(container:GetChildren()) do
+		table.insert(t, c.Name .. "(" .. c.ClassName .. ")")
+	end
+	return table.concat(t, ", ")
+end
+
+-- Recursively finds the first Model with the given name under root
+local function findNamedModelRecursive(root, name)
+	if not root then return nil end
+	for _, inst in ipairs(root:GetDescendants()) do
+		if inst:IsA("Model") and inst.Name == name then
+			return inst
+		end
+	end
+	return nil
+end
+
+-- Ensures ReplicatedStorage.AOI exists and returns it
+local function ensureRepAOI()
+	local aoi = getAOI(ReplicatedStorage)
+	if not aoi then
+		aoi = Instance.new("Folder")
+		aoi.Name = AOI_FOLDER_NAME
+		aoi.Parent = ReplicatedStorage
+		print("Created ReplicatedStorage." .. AOI_FOLDER_NAME)
+	end
+	return aoi
+end
+
+-- Resolves the bunker source  prefers ReplicatedStorage.AOI then ReplicatedStorage then Workspace.AOI and normalizes into ReplicatedStorage.AOI
+local function resolveSourceBunker()
+	local repAOI = ensureRepAOI()
+	local src = findNamedModelRecursive(repAOI, BUNKER_NAME)
+	if src then return src end
+	src = findNamedModelRecursive(ReplicatedStorage, BUNKER_NAME)
+	if src then
+		if src.Parent ~= repAOI then
+			src.Parent = repAOI
+			print("Moved " .. BUNKER_NAME .. " into ReplicatedStorage." .. AOI_FOLDER_NAME)
+		end
+		return src
+	end
+	local worldAOI = getAOI(Workspace)
+	if worldAOI then
+		src = findNamedModelRecursive(worldAOI, BUNKER_NAME)
+		if src then
+			src.Parent = repAOI
+			print("Moved " .. BUNKER_NAME .. " from Workspace." .. AOI_FOLDER_NAME .. " to ReplicatedStorage." .. AOI_FOLDER_NAME)
+			return src
+		end
+	end
+	warn("No source model named " .. BUNKER_NAME .. " found. ReplicatedStorage children: " .. listChildren(ReplicatedStorage))
+	return nil
+end
+
+-- Returns an array of BaseParts under Workspace.AOI.BunkerSpawns
+local function getSpawnPoints()
+	local aoiWorld = getAOI(Workspace)
+	if not aoiWorld then
+		warn("Workspace has no AOI folder. Children of Workspace: " .. listChildren(Workspace))
+		return {}
+	end
+	local spawnFolder = aoiWorld:FindFirstChild(SPAWN_FOLDER_NAME)
+	if not spawnFolder then
+		warn("Workspace.AOI has no " .. SPAWN_FOLDER_NAME .. " folder. AOI children: " .. listChildren(aoiWorld))
+		return {}
+	end
+	local points = {}
+	for _, inst in ipairs(spawnFolder:GetChildren()) do
+		if inst:IsA("BasePart") then
+			table.insert(points, inst)
+		end
+	end
+	print("Found " .. tostring(#points) .. " spawn placeholders in Workspace.AOI." .. SPAWN_FOLDER_NAME)
+	return points
+end
+
+-- Ensures Workspace.AOI exists and returns it
+local function ensureWorkspaceAOI()
+	local aoi = getAOI(Workspace)
+	if not aoi then
+		aoi = Instance.new("Folder")
+		aoi.Name = AOI_FOLDER_NAME
+		aoi.Parent = Workspace
+		print("Created Workspace." .. AOI_FOLDER_NAME)
+	end
+	return aoi
+end
+
+-- Returns the yaw offset degrees from a NumberValue on the bunker or the default
+local function getYawOffsetDegrees(bunkerModel)
+	local v = bunkerModel:FindFirstChild("YawOffset")
+	return (v and v:IsA("NumberValue")) and v.Value or DEFAULT_YAW_OFFSET_DEG
+end
+
+-- Pivots the model to a target CFrame with an additional yaw rotation in degrees
+local function pivotModelTo(model, targetCF, yawDeg)
+	if yawDeg ~= 0 then
+		targetCF = targetCF * CFrame.Angles(0, math.rad(yawDeg), 0)
+	end
+	model:PivotTo(targetCF)
+end
+
+-- Carves terrain using all BaseParts under Bunker.TerrainCutters
+local function carveWithCutters(model)
+	local cutters = model:FindFirstChild(CUTTERS_FOLDER_NAME)
+	if not cutters then return false end
+	local count = 0
+	for _, d in ipairs(cutters:GetDescendants()) do
+		if d:IsA("BasePart") then
+			TERRAIN:FillBlock(d.CFrame, d.Size, Enum.Material.Air)
+			count += 1
+		end
+	end
+	print("Carved with " .. tostring(count) .. " cutter parts")
+	return count > 0
+end
+
+-- Carves terrain using the bunker bounding box with optional vertical padding
+local function carveWithBoundingBox(model)
+	local cf, size = model:GetBoundingBox()
+	size = size + Vector3.new(0, EXTRA_CARVE_MARGIN_Y, 0)
+	TERRAIN:FillBlock(cf, size, Enum.Material.Air)
+	print(string.format("Carved with model bounding box size %.1f %.1f %.1f", size.X, size.Y, size.Z))
+end
+
+-- Ensures the model has a PrimaryPart by reusing Pivot if found or creating an invisible tiny pivot at the bottom center of the bounding box
+local function ensurePrimaryPart(model)
+	if model.PrimaryPart then return model.PrimaryPart end
+	local existing = model:FindFirstChild("Pivot", true)
+	if existing and existing:IsA("BasePart") then
+		model.PrimaryPart = existing
+		return existing
+	end
+	local cf, size = model:GetBoundingBox()
+	local pivot = Instance.new("Part")
+	pivot.Name = "Pivot"
+	pivot.Size = Vector3.new(0.2, 0.2, 0.2)
+	pivot.Anchored = true
+	pivot.CanCollide = false
+	pivot.Transparency = 1
+	pivot.Parent = model
+	local bottomCenter = cf * CFrame.new(0, -size.Y / 2, 0)
+	pivot.CFrame = bottomCenter
+	model.PrimaryPart = pivot
+	return pivot
+end
+
+-- Orchestrates one spawn  resolves source  chooses a placeholder  clones  aligns  carves  and logs success
+local function spawnBunkerOnce()
+	task.wait(0.25)
+	math.randomseed(tick() % 1e6)
+	for _ = 1, 4 do math.random() end
+	local source = resolveSourceBunker()
+	if not source then
+		warn("Aborting. No source bunker model named " .. BUNKER_NAME)
+		return
+	end
+	local spawns = getSpawnPoints()
+	if #spawns == 0 then
+		warn("Aborting. No placeholder BaseParts under Workspace.AOI." .. SPAWN_FOLDER_NAME)
+		return
+	end
+	local chosen = spawns[math.random(1, #spawns)]
+	print("Chosen spawn is " .. chosen:GetFullName())
+	local aoiWorld = ensureWorkspaceAOI()
+	local destFolder = Instance.new("Folder")
+	destFolder.Name = string.format("Bunker_%s_%d", chosen.Name, os.time())
+	destFolder.Parent = aoiWorld
+	print("Created destination " .. destFolder:GetFullName())
+	local bunker = source:Clone()
+	bunker.Name = BUNKER_NAME
+	bunker.Parent = destFolder
+	ensurePrimaryPart(bunker)
+	pivotModelTo(bunker, chosen.CFrame, getYawOffsetDegrees(bunker))
+	local carved = carveWithCutters(bunker)
+	if not carved then
+		carveWithBoundingBox(bunker)
+	end
+	print("Success. Spawned bunker at " .. chosen:GetFullName() .. " inside " .. destFolder:GetFullName())
+end
+
+if RunService:IsServer() then
+	local ok, err = pcall(spawnBunkerOnce)
+	if not ok then
+		warn("Unhandled error " .. tostring(err))
+	end
+else
+	warn("This must be a Server Script in ServerScriptService")
+end
