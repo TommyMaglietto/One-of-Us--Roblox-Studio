@@ -1,0 +1,290 @@
+-- StarterCharacterScripts/FirstPersonControllerWithRagdollHandoff
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- Wait for character & humanoid
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+
+-- Server creates this; we listen for handoff
+local ragdollEvent = ReplicatedStorage:WaitForChild("RagdollCamEvent")
+
+-- ================= SETTINGS =================
+local bobSpeed = .2
+local bobDistance = .2
+local bobWalkMulti = 55
+local walkVeloThreshold = 9
+
+local defaultFOV = 60
+local targetFOV = 60
+local fovChange = 8
+local maxFOVvelocity = 10
+local FOVsmooth = 3
+
+local sensitivity = .15
+local unlockMouseButton = Enum.KeyCode.G
+local maxVerticalAngle = math.rad(80)
+local camOffset = 2
+local turnLeanAmt = 400
+local turnLeanSmoothing = .9
+local turnLeanMax = .2
+
+local camSmooth = 16
+-- ============================================
+
+-- Controller state
+local firstPersonEnabled = true
+local verticalAngle, horizontalAngle, zAngle = 0, 0, 0
+local targetCFrame = CFrame.new()
+local targetRot    = CFrame.Angles(0,0,0)
+
+-- Save/restore player camera prefs
+local originals = { mouseBehavior=nil, mouseIcon=nil, camMin=nil, camMax=nil, camMode=nil }
+local function saveOriginals()
+	originals.mouseBehavior = UserInputService.MouseBehavior
+	originals.mouseIcon     = UserInputService.MouseIconEnabled
+	originals.camMin        = player.CameraMinZoomDistance
+	originals.camMax        = player.CameraMaxZoomDistance
+	originals.camMode       = player.CameraMode
+end
+
+-- Visibility helpers (do NOT reveal HumanoidRootPart; use LocalTransparencyModifier)
+local function showForThirdPerson(char)
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			if d.Name ~= "HumanoidRootPart" then
+				d.LocalTransparencyModifier = 0
+			end
+		elseif d:IsA("Decal") then
+			d.Transparency = 0
+		end
+	end
+end
+
+-- Enhanced hide to cover accessories and decals reliably
+local function hideForFirstPerson(char)
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.LocalTransparencyModifier = 1
+		elseif d:IsA("Decal") then
+			d.Transparency = 1
+		elseif d:IsA("Accessory") then
+			local handle = d:FindFirstChildWhichIsA("BasePart")
+			if handle then
+				handle.LocalTransparencyModifier = 1
+			end
+		end
+	end
+end
+
+-- Mouse lock helpers
+local function lockMouse()
+	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	UserInputService.MouseIconEnabled = false
+end
+
+-- Hard-prepare rig and camera right after spawn/respawn to avoid inside-head frame
+local function waitRigAndPrime(char: Model)
+	local hum = char:WaitForChild("Humanoid")
+	local hrp = char:WaitForChild("HumanoidRootPart")
+	if char.PrimaryPart ~= hrp then
+		char.PrimaryPart = hrp
+	end
+
+	-- Clear any inherited offsets or subjects that can fight script
+	camera.CameraSubject = nil
+	hum.CameraOffset = Vector3.new(0, 0, 0)
+
+	-- Reset angles so we do not reuse old state
+	verticalAngle, horizontalAngle, zAngle = 0, 0, 0
+	targetRot = CFrame.Angles(0, 0, 0)
+
+	-- Build initial FP target and HARD SNAP before any lerp
+	local offset = Vector3.new(0, camOffset, 0)
+	local startPos = hrp.Position + offset
+	targetCFrame = CFrame.new(startPos) * targetRot
+	camera.CFrame = targetCFrame
+end
+
+-- Enter FP baseline (once per spawn)
+local function enterFirstPersonOnce()
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.CameraSubject = nil
+	lockMouse()
+	humanoid.AutoRotate = false
+	task.defer(lockMouse)
+	RunService.RenderStepped:Wait()
+	lockMouse()
+	UserInputService.WindowFocused:Connect(lockMouse)
+end
+
+-- Camera math
+local function UpdateCameraRotation(change)
+	local c = change * sensitivity
+	horizontalAngle += math.rad(c.x)
+	zAngle = math.clamp(zAngle + (c.x / turnLeanAmt), -turnLeanMax, turnLeanMax)
+	verticalAngle = math.clamp(verticalAngle + math.rad(c.y), -maxVerticalAngle, maxVerticalAngle)
+	targetRot = CFrame.Angles(0, horizontalAngle, 0) * CFrame.Angles(verticalAngle, 0, 0)
+end
+
+-- Use HRP world position for stability after server PivotTo
+local function UpdateCameraPosition()
+	if not character then return end
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local bobPos = math.sin(tick() * bobSpeed) * bobDistance
+	if hrp.AssemblyLinearVelocity.Magnitude >= walkVeloThreshold then
+		bobPos = math.sin(tick() * (bobSpeed * bobWalkMulti)) * bobDistance
+	end
+
+	local offset = Vector3.new(0, camOffset + bobPos, 0)
+	local pos = hrp.Position + offset
+	targetCFrame = CFrame.new(pos) * targetRot
+end
+
+local function SmoothCameraZAxis(deltaTime)
+	local amt = deltaTime / turnLeanSmoothing
+	if zAngle > 0 then
+		zAngle = math.max(zAngle - amt, 0)
+	elseif zAngle < 0 then
+		zAngle = math.min(zAngle + amt, 0)
+	end
+	local zRotation = CFrame.Angles(0, 0, zAngle)
+	targetRot = CFrame.Angles(0, horizontalAngle, 0) * CFrame.Angles(verticalAngle, 0, 0) * zRotation
+end
+
+local function UpdateFOV(deltaTime)
+	if not player.Character then return end
+	local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local velocity = hrp.AssemblyLinearVelocity.Magnitude
+	local normalizedVelocity = math.clamp(velocity / maxFOVvelocity, 0, 1)
+	targetFOV = defaultFOV + (normalizedVelocity * fovChange)
+	camera.FieldOfView = camera.FieldOfView + (targetFOV - camera.FieldOfView) * deltaTime * FOVsmooth
+end
+
+-- Inputs (gated by firstPersonEnabled)
+UserInputService.InputChanged:Connect(function(input, processed)
+	if not firstPersonEnabled then return end
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		UpdateCameraRotation(-Vector3.new(input.Delta.X, input.Delta.Y, 0))
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not firstPersonEnabled then return end
+	if input.KeyCode == unlockMouseButton then
+		if UserInputService.MouseIconEnabled then
+			lockMouse()
+		else
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			UserInputService.MouseIconEnabled = true
+		end
+	end
+end)
+
+UserInputService.TouchMoved:Connect(function(touch, processed)
+	if processed or not firstPersonEnabled then return end
+	UpdateCameraRotation(-Vector3.new(touch.Delta.X, touch.Delta.Y, 0))
+end)
+
+RunService.RenderStepped:Connect(function(deltaTime)
+	if firstPersonEnabled then
+		local dX, dY = UserInputService:GetMouseDelta()
+		if dX ~= 0 or dY ~= 0 then
+			UpdateCameraRotation(-Vector3.new(dX, dY, 0))
+		end
+		UpdateCameraPosition()
+		SmoothCameraZAxis(deltaTime)
+		UpdateFOV(deltaTime)
+		camera.CFrame = camera.CFrame:Lerp(targetCFrame, deltaTime * camSmooth)
+
+		-- keep character facing camera Y
+		if character and character.PrimaryPart then
+			local _, camY, _ = camera.CFrame:ToOrientation()
+			character:SetPrimaryPartCFrame(CFrame.new(character.PrimaryPart.Position) * CFrame.Angles(0, camY, 0))
+		end
+	end
+end)
+
+-- Initial FP
+hideForFirstPerson(character)
+waitRigAndPrime(character)
+enterFirstPersonOnce()
+
+-- Respawn support
+player.CharacterAdded:Connect(function(char)
+	character = char
+	humanoid = char:WaitForChild("Humanoid")
+	camera = workspace.CurrentCamera
+	hideForFirstPerson(character)
+	waitRigAndPrime(character)
+	enterFirstPersonOnce()
+end)
+
+-- ============== TEMP THIRD-PERSON HANDOFF ==============
+local function enterRagdollThirdPerson(duration)
+	duration = duration or 2
+	firstPersonEnabled = false
+	saveOriginals()
+
+	-- Show body (but HRP stays hidden), unequip tools client-side too
+	showForThirdPerson(character)
+	if humanoid then humanoid:UnequipTools() end
+
+	-- Third-person camera setup
+	player.CameraMode = Enum.CameraMode.Classic
+	player.CameraMinZoomDistance = 8
+	player.CameraMaxZoomDistance = 18
+
+	-- Snap a clear angle first
+	camera.CameraType = Enum.CameraType.Scriptable
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		local back, up = 12, 7
+		local pos = (hrp.CFrame * CFrame.new(0, up, back)).Position
+		camera.CFrame = CFrame.lookAt(pos, hrp.Position + Vector3.new(0, 3, 0))
+	end
+
+	-- Hand control to Roblox default
+	task.defer(function()
+		camera.CameraType = Enum.CameraType.Custom
+		camera.CameraSubject = humanoid
+	end)
+
+	-- Free mouse while 3P
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+
+	-- Restore after duration
+	task.delay(duration, function()
+		if not character or not character.Parent then return end
+
+		-- Hide again for FP
+		hideForFirstPerson(character)
+
+		-- Restore camera prefs
+		player.CameraMinZoomDistance = originals.camMin or 0.5
+		player.CameraMaxZoomDistance = originals.camMax or 128
+		player.CameraMode = originals.camMode or Enum.CameraMode.Classic
+
+		-- Return to our FP control
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.CameraSubject = nil
+		lockMouse()
+		firstPersonEnabled = true
+
+		-- Reprime to avoid one-frame inside-head when returning
+		waitRigAndPrime(character)
+	end)
+end
+
+ragdollEvent.OnClientEvent:Connect(function(duration)
+	enterRagdollThirdPerson(duration)
+end)
