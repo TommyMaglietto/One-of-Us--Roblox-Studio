@@ -1,0 +1,70 @@
+-- StarterPlayer/StarterPlayerScripts/InventoryClient.client.lua
+-- Block equipping the "Planks xN" tool by forcing it back to Backpack
+
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local TOOL_BASE = "Planks" -- matches server name prefix
+
+local function isPlankTool(inst)
+	return inst and inst:IsA("Tool") and inst.Name:match("^"..TOOL_BASE)
+end
+
+local function getBackpack()
+	return player:FindFirstChildOfClass("Backpack")
+end
+
+-- Whenever a plank tool tries to equip (Tool parented to Character), move it back
+local function guardTool(tool)
+	if not isPlankTool(tool) then return end
+	tool.ManualActivationOnly = true
+	tool.CanBeDropped = false
+
+	tool:GetPropertyChangedSignal("Parent"):Connect(function()
+		local char = player.Character
+		if char and tool.Parent == char then
+			-- Immediately unequip and return to backpack
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hum then hum:UnequipTools() end
+
+			local bp = getBackpack()
+			if bp then tool.Parent = bp end
+		end
+	end)
+end
+
+-- Watch current and future tools in Backpack
+local function watchBackpack(bp)
+	for _, child in ipairs(bp:GetChildren()) do
+		if isPlankTool(child) then guardTool(child) end
+	end
+	bp.ChildAdded:Connect(function(child)
+		if isPlankTool(child) then guardTool(child) end
+	end)
+end
+
+-- If a plank tool appears directly under Character (e.g., hotbar equip), push it back
+local function watchCharacter(char)
+	char.ChildAdded:Connect(function(child)
+		if isPlankTool(child) then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hum then hum:UnequipTools() end
+			local bp = getBackpack()
+			if bp then child.Parent = bp end
+		end
+	end)
+end
+
+-- Init hooks
+player.CharacterAdded:Connect(function(char)
+	watchCharacter(char)
+end)
+if player.Character then watchCharacter(player.Character) end
+
+local bp = getBackpack()
+if bp then watchBackpack(bp) end
+player.ChildAdded:Connect(function(child)
+	if child:IsA("Backpack") then
+		watchBackpack(child)
+	end
+end)

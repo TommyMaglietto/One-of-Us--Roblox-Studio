@@ -1,87 +1,77 @@
--- ServerScriptService/InventoryPlanks.server.lua
--- Keeps a non-selectable "Planks xN" tool and increments it when collecting
-local Players = game:GetService("Players")
-local PPS = game:GetService("ProximityPromptService")
+-- ServerScriptService/PromptSeeder.server.lua
+-- Adds Collect prompts to planks under workspace.Planks
+-- Adds Place prompts to bridge placeholders under workspace.AOI.Bridge.Placeholders
 
-local TOOL_BASE = "Planks"       -- base display name
-local TOOL_ICON = ""             -- optional e.g. "rbxassetid://12345"
+local WK = workspace
+local AOI = WK:WaitForChild("AOI")
+local BRIDGE = AOI:WaitForChild("Bridge")
+local PLACEHOLDERS = BRIDGE:WaitForChild("Placeholders")
+local PLANKS = WK:WaitForChild("Planks")
 
-local function ensureInventory(plr)
-	local inv = plr:FindFirstChild("Inventory")
-	if not inv then
-		inv = Instance.new("Folder")
-		inv.Name = "Inventory"
-		inv.Parent = plr
-	end
-	local count = inv:FindFirstChild("PlankCount")
-	if not count then
-		count = Instance.new("IntValue")
-		count.Name = "PlankCount"
-		count.Value = 0
-		count.Parent = inv
-	end
-	return inv, count
-end
+local PICKUP_MAX_DIST = 35
+local PLACE_MAX_DIST  = 40
 
-local function getOrMakeTool(container)
-	for _, t in ipairs(container:GetChildren()) do
-		if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then
-			return t
-		end
-	end
-	local tool = Instance.new("Tool")
-	tool.RequiresHandle = false
-	tool.CanBeDropped = false
-	tool.ManualActivationOnly = true -- we also block equip on client
-	if TOOL_ICON ~= "" then tool.TextureId = TOOL_ICON end
-	tool.Name = TOOL_BASE.." x0"
-	tool.Parent = container
-	return tool
-end
-
-local function updateTool(plr, countVal)
-	local bp = plr:FindFirstChildOfClass("Backpack")
-	if bp then
-		local t = getOrMakeTool(bp)
-		t.Name = string.format("%s x%d", TOOL_BASE, countVal)
-	end
-	local sg = plr:FindFirstChild("StarterGear")
-	if sg then
-		local t2 = getOrMakeTool(sg)
-		t2.Name = string.format("%s x%d", TOOL_BASE, countVal)
-	end
-	if countVal <= 0 then
-		-- remove the tool when zero
-		if bp then
-			for _, t in ipairs(bp:GetChildren()) do
-				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
-			end
-		end
-		local sg2 = plr:FindFirstChild("StarterGear")
-		if sg2 then
-			for _, t in ipairs(sg2:GetChildren()) do
-				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
-			end
+local function hostPart(inst)
+	if inst:IsA("BasePart") then return inst end
+	if inst:IsA("Model") then
+		if inst.PrimaryPart then return inst.PrimaryPart end
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("BasePart") then return d end
 		end
 	end
 end
 
-Players.PlayerAdded:Connect(function(plr)
-	local _, count = ensureInventory(plr)
-	count:GetPropertyChangedSignal("Value"):Connect(function()
-		updateTool(plr, count.Value)
-	end)
-end)
+local function seedPickup(inst)
+	if not inst:IsDescendantOf(PLANKS) then return end
+	if inst.Name ~= "Plank" then return end
+	if not (inst:IsA("BasePart") or inst:IsA("Model")) then return end
+	local host = hostPart(inst); if not host then return end
+	if host:FindFirstChild("PickUpPlank") then return end
 
--- Collect: E on a Plank -> +1 count, delete world plank
-PPS.PromptTriggered:Connect(function(prompt, plr)
-	if prompt.Name ~= "PickUpPlank" then return end
-	local part = prompt.Parent
-	if not part or not part:IsA("BasePart") or part.Name ~= "Plank" then return end
+	local pp = Instance.new("ProximityPrompt")
+	pp.Name = "PickUpPlank"
+	pp.ActionText = "Collect"
+	pp.ObjectText = "Plank"
+	pp.KeyboardKeyCode = Enum.KeyCode.E
+	pp.GamepadKeyCode  = Enum.KeyCode.ButtonX
+	pp.ClickablePrompt = true
+	pp.HoldDuration = 0.5
+	pp.RequiresLineOfSight = false
+	pp.MaxActivationDistance = PICKUP_MAX_DIST
+	pp.Parent = host
+end
 
-	local _, count = ensureInventory(plr)
-	count.Value += 1
-	updateTool(plr, count.Value)
+local function seedPlace(inst)
+	if not inst:IsDescendantOf(PLACEHOLDERS) then return end
+	local host = hostPart(inst); if not host then return end
 
-	part:Destroy()
-end)
+	host.Name = "PlankPlaceholder"
+	host.Anchored = true
+	host.CanCollide = false
+	host.Transparency = 1
+
+	if not host:FindFirstChild("Occupied") then
+		local b = Instance.new("BoolValue"); b.Name = "Occupied"; b.Value = false; b.Parent = host
+	end
+	if not host:FindFirstChild("Snap") then
+		local a = Instance.new("Attachment"); a.Name = "Snap"; a.Parent = host
+	end
+	if not host:FindFirstChild("PlacePlankHere") then
+		local pp = Instance.new("ProximityPrompt")
+		pp.Name = "PlacePlankHere"
+		pp.ActionText = "Place"
+		pp.ObjectText = "Bridge Slot"
+		pp.KeyboardKeyCode = Enum.KeyCode.E
+		pp.GamepadKeyCode  = Enum.KeyCode.ButtonA
+		pp.ClickablePrompt = true
+		pp.HoldDuration = 0.5
+		pp.RequiresLineOfSight = false
+		pp.MaxActivationDistance = PLACE_MAX_DIST
+		pp.Parent = host
+	end
+end
+
+for _, d in ipairs(PLANKS:GetDescendants()) do seedPickup(d) end
+for _, d in ipairs(PLACEHOLDERS:GetDescendants()) do seedPlace(d) end
+PLANKS.DescendantAdded:Connect(function(d) task.defer(function() seedPickup(d) end) end)
+PLACEHOLDERS.DescendantAdded:Connect(function(d) task.defer(function() seedPlace(d) end) end)

@@ -1,0 +1,163 @@
+local RS = game:GetService("ReplicatedStorage")
+local WK = workspace
+local SPAWNS = WK:WaitForChild("PlankSpawns")
+local PLANKS = WK:WaitForChild("Planks")
+local WORLD_TEMPLATE = RS:WaitForChild("WorldPlankTemplate")
+
+local SPAWN_PITCH_DEG = 90
+local MIN_INITIAL_SPAWNS = 6
+
+local function hostPart(inst)
+	-- Return a BasePart to use as reference for position and prompts
+	if inst:IsA("BasePart") then return inst end
+	if inst:IsA("Model") then
+		if inst.PrimaryPart then return inst.PrimaryPart end
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("BasePart") then return d end
+		end
+	end
+end
+
+local function getNumberAttr(obj, name, default)
+	-- Return the number attribute if it exists, otherwise a default
+	local v = obj:GetAttribute(name)
+	if v == nil then return default end
+	if typeof(v) == "number" then return v end
+	return default
+end
+
+local function ensurePickupPrompt(inst)
+	-- Add a ProximityPrompt to a newly spawned plank if it does not have one
+	local host = hostPart(inst); if not host then return end
+	if host:FindFirstChild("PickUpPlank") then return end
+	local pp = Instance.new("ProximityPrompt")
+	pp.Name = "PickUpPlank"
+	pp.ActionText = "Collect"
+	pp.ObjectText = "Plank"
+	pp.KeyboardKeyCode = Enum.KeyCode.E
+	pp.GamepadKeyCode  = Enum.KeyCode.ButtonX
+	pp.ClickablePrompt = true
+	pp.HoldDuration = 0.5
+	pp.RequiresLineOfSight = false
+	pp.MaxActivationDistance = 35
+	pp.Parent = host
+end
+
+local function countPlanksNear(pos, radius)
+	-- Count how many planks exist within a radius of a given position
+	local n = 0
+	for _, inst in ipairs(PLANKS:GetDescendants()) do
+		if inst.Name == "Plank" and (inst:IsA("BasePart") or inst:IsA("Model")) then
+			local hp = hostPart(inst)
+			if hp and (hp.Position - pos).Magnitude <= radius then
+				n += 1
+			end
+		end
+	end
+	return n
+end
+
+local function spawnPlankAt(host)
+	-- Clone the world template, position it with +90 X rotation, and add a pickup prompt
+	local clone = WORLD_TEMPLATE:Clone()
+	clone.Name = "Plank"
+	local cf = host.CFrame * CFrame.new(0, 0.25, 0) * CFrame.Angles(math.rad(SPAWN_PITCH_DEG), 0, 0)
+	if clone:IsA("BasePart") then
+		clone.CFrame = cf
+		clone.Anchored = false
+		clone.CanCollide = true
+		clone.Parent = PLANKS
+	elseif clone:IsA("Model") then
+		if not clone.PrimaryPart then
+			for _, d in ipairs(clone:GetDescendants()) do
+				if d:IsA("BasePart") then clone.PrimaryPart = d; break end
+			end
+		end
+		if clone.PrimaryPart then
+			clone:PivotTo(cf)
+			for _, d in ipairs(clone:GetDescendants()) do
+				if d:IsA("BasePart") then d.Anchored = false end
+			end
+		end
+		clone.Parent = PLANKS
+	end
+	ensurePickupPrompt(clone)
+	return clone
+end
+
+local function processSpawn(spawnInst)
+	-- Roll chance to spawn at this spot and set up periodic respawns
+	if not (spawnInst:IsA("BasePart") or spawnInst:IsA("Model")) then return end
+	if spawnInst.Name ~= "PlankSpawn" then return end
+	local host = hostPart(spawnInst); if not host then return end
+	local chance   = getNumberAttr(spawnInst, "SpawnChance", 0.8)
+	local respawn  = getNumberAttr(spawnInst, "RespawnSeconds", 0)
+	local capacity = math.max(1, math.floor(getNumberAttr(spawnInst, "MaxSimultaneous", 1)))
+	local radius   = getNumberAttr(spawnInst, "OccupyRadius", 6)
+	if countPlanksNear(host.Position, radius) < capacity then
+		if math.random() < chance then spawnPlankAt(host) end
+	end
+	if respawn > 0 then
+		task.spawn(function()
+			while true do
+				task.wait(respawn)
+				if countPlanksNear(host.Position, radius) < capacity then
+					if math.random() < chance then spawnPlankAt(host) end
+				end
+			end
+		end)
+	end
+	return { host = host, capacity = capacity, radius = radius }
+end
+
+local function shuffle(t)
+	-- Randomize table order for fair distribution
+	for i = #t, 2, 1 do
+		local j = math.random(i)
+		t[i], t[j] = t[j], t[i]
+	end
+end
+
+-- Collect all spots and attempt initial spawns
+local allSpots = {}
+for _, d in ipairs(SPAWNS:GetDescendants()) do
+	if d.Name == "PlankSpawn" and (d:IsA("BasePart") or d:IsA("Model")) then
+		local info = processSpawn(d)
+		if info then table.insert(allSpots, info) end
+	end
+end
+
+-- Count how many planks exist and top up to the minimum if needed
+do
+	local total = 0
+	for _, inst in ipairs(PLANKS:GetDescendants()) do
+		if inst.Name == "Plank" and (inst:IsA("BasePart") or inst:IsA("Model")) then
+			total += 1
+		end
+	end
+	if total < MIN_INITIAL_SPAWNS and #allSpots > 0 then
+		shuffle(allSpots)
+		local safety = 0
+		while total < MIN_INITIAL_SPAWNS and safety < 1000 do
+			safety += 1
+			local progressed = false
+			for _, spot in ipairs(allSpots) do
+				if total >= MIN_INITIAL_SPAWNS then break end
+				local currentAtSpot = countPlanksNear(spot.host.Position, spot.radius)
+				if currentAtSpot < spot.capacity then
+					spawnPlankAt(spot.host)
+					total += 1
+					progressed = true
+					if total >= MIN_INITIAL_SPAWNS then break end
+				end
+			end
+			if not progressed then break end
+		end
+	end
+end
+
+SPAWNS.DescendantAdded:Connect(function(d)
+	if d.Name == "PlankSpawn" then
+		task.defer(function() processSpawn(d) end)
+	end
+end)

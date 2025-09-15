@@ -1,61 +1,59 @@
--- ServerScriptService/PromptSeeder.server.lua
--- Adds Collect prompts to Workspace.Planks and Place prompts to Workspace.AOI.Bridge.Placeholders
+local RS = game:GetService("ReplicatedStorage")
+local PPS = game:GetService("ProximityPromptService")
+local TEMPLATE = RS:WaitForChild("PlankTemplate")
+local TOOL_BASE = "Planks"
 
-local WK = workspace
-local AOI = WK:WaitForChild("AOI")
-local BRIDGE = AOI:WaitForChild("Bridge")
-local PLACEHOLDERS = BRIDGE:WaitForChild("Placeholders")
-local PLANKS = WK:WaitForChild("Planks")
-
-local function ensureCollectPrompt(plank)
-	if not plank:IsA("BasePart") or plank.Name ~= "Plank" then return end
-	if plank:FindFirstChild("PickUpPlank") then return end
-	local pp = Instance.new("ProximityPrompt")
-	pp.Name = "PickUpPlank"
-	pp.ActionText = "Collect"
-	pp.ObjectText = "Plank"
-	pp.KeyboardKeyCode = Enum.KeyCode.E
-	pp.HoldDuration = 1
-	pp.RequiresLineOfSight = true
-	pp.MaxActivationDistance = 35
-	pp.Parent = plank
+local function getCount(plr)
+	local inv = plr:FindFirstChild("Inventory")
+	return inv and inv:FindFirstChild("PlankCount")
 end
 
-local function ensurePlacePrompt(slot)
-	if not slot:IsA("BasePart") then return end
-	slot.Name = "PlankPlaceholder"
-	slot.Anchored = true
-	slot.CanCollide = false
-	slot.Transparency = 1
-
-	if not slot:FindFirstChild("Occupied") then
-		local b = Instance.new("BoolValue")
-		b.Name = "Occupied"
-		b.Value = false
-		b.Parent = slot
+local function updateToolNames(plr, newVal)
+	local function upd(container)
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then
+				if newVal > 0 then t.Name = string.format("%s x%d", TOOL_BASE, newVal) else t:Destroy() end
+			end
+		end
 	end
-
-	if not slot:FindFirstChild("Snap") then
-		local a = Instance.new("Attachment")
-		a.Name = "Snap"
-		a.Parent = slot
-	end
-
-	if not slot:FindFirstChild("PlacePlankHere") then
-		local pp = Instance.new("ProximityPrompt")
-		pp.Name = "PlacePlankHere"
-		pp.ActionText = "Place"
-		pp.ObjectText = "Bridge Slot"
-		pp.KeyboardKeyCode = Enum.KeyCode.E
-		pp.HoldDuration = 1
-		pp.RequiresLineOfSight = false
-		pp.MaxActivationDistance = 40
-		pp.Parent = slot
-	end
+	local bp = plr:FindFirstChildOfClass("Backpack"); if bp then upd(bp) end
+	local sg = plr:FindFirstChild("StarterGear");    if sg then upd(sg) end
 end
 
-for _, p in ipairs(PLANKS:GetChildren()) do ensureCollectPrompt(p) end
-PLANKS.ChildAdded:Connect(function(c) task.defer(function() ensureCollectPrompt(c) end) end)
+local function snapCF(slot: BasePart)
+	local a = slot:FindFirstChild("Snap")
+	return (a and a:IsA("Attachment")) and a.WorldCFrame or slot.CFrame
+end
 
-for _, s in ipairs(PLACEHOLDERS:GetChildren()) do ensurePlacePrompt(s) end
-PLACEHOLDERS.ChildAdded:Connect(function(c) task.defer(function() ensurePlacePrompt(c) end) end)
+PPS.PromptTriggered:Connect(function(prompt, plr)
+	if prompt.Name ~= "PlacePlankHere" then return end
+	local slot = prompt.Parent
+	if not slot or not slot:IsA("BasePart") then return end
+	if slot.Name ~= "PlankPlaceholder" then return end
+
+	-- Check occupancy and inventory
+	local occ = slot:FindFirstChild("Occupied"); if occ and occ.Value == true then return end
+	local count = getCount(plr); if not count or count.Value <= 0 then return end
+
+	-- Spawn placed plank
+	local cf = snapCF(slot)
+	local clone = TEMPLATE:Clone()
+	if clone:IsA("BasePart") then
+		clone.CFrame = cf; clone.Anchored = true; clone.CanCollide = true
+	elseif clone:IsA("Model") then
+		if not clone.PrimaryPart then
+			for _, d in ipairs(clone:GetDescendants()) do if d:IsA("BasePart") then clone.PrimaryPart = d; break end end
+		end
+		if clone.PrimaryPart then clone:PivotTo(cf) end
+	end
+
+	local bridge = slot:FindFirstAncestor("Bridge")
+	if bridge then clone.Parent = bridge else clone.Parent = workspace end
+
+	count.Value -= 1
+	updateToolNames(plr, count.Value)
+
+	if not occ then occ = Instance.new("BoolValue"); occ.Name = "Occupied"; occ.Value = false; occ.Parent = slot end
+	occ.Value = true
+	slot:Destroy()
+end)

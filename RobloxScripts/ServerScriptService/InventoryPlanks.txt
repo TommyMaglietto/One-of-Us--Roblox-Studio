@@ -1,39 +1,24 @@
--- ServerScriptService/InventoryPlanks.server.lua
--- Keeps a non-selectable "Planks xN" tool and increments it when collecting
 local Players = game:GetService("Players")
 local PPS = game:GetService("ProximityPromptService")
 
-local TOOL_BASE = "Planks"       -- base display name
-local TOOL_ICON = ""             -- optional e.g. "rbxassetid://12345"
+local TOOL_BASE = "Planks"    -- the hotbar display name prefix
 
 local function ensureInventory(plr)
 	local inv = plr:FindFirstChild("Inventory")
-	if not inv then
-		inv = Instance.new("Folder")
-		inv.Name = "Inventory"
-		inv.Parent = plr
-	end
+	if not inv then inv = Instance.new("Folder"); inv.Name = "Inventory"; inv.Parent = plr end
 	local count = inv:FindFirstChild("PlankCount")
-	if not count then
-		count = Instance.new("IntValue")
-		count.Name = "PlankCount"
-		count.Value = 0
-		count.Parent = inv
-	end
+	if not count then count = Instance.new("IntValue"); count.Name = "PlankCount"; count.Value = 0; count.Parent = inv end
 	return inv, count
 end
 
 local function getOrMakeTool(container)
 	for _, t in ipairs(container:GetChildren()) do
-		if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then
-			return t
-		end
+		if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then return t end
 	end
 	local tool = Instance.new("Tool")
 	tool.RequiresHandle = false
 	tool.CanBeDropped = false
-	tool.ManualActivationOnly = true -- we also block equip on client
-	if TOOL_ICON ~= "" then tool.TextureId = TOOL_ICON end
+	tool.ManualActivationOnly = true
 	tool.Name = TOOL_BASE.." x0"
 	tool.Parent = container
 	return tool
@@ -41,28 +26,13 @@ end
 
 local function updateTool(plr, countVal)
 	local bp = plr:FindFirstChildOfClass("Backpack")
-	if bp then
-		local t = getOrMakeTool(bp)
-		t.Name = string.format("%s x%d", TOOL_BASE, countVal)
-	end
+	if bp then getOrMakeTool(bp).Name = string.format("%s x%d", TOOL_BASE, countVal) end
 	local sg = plr:FindFirstChild("StarterGear")
-	if sg then
-		local t2 = getOrMakeTool(sg)
-		t2.Name = string.format("%s x%d", TOOL_BASE, countVal)
-	end
+	if sg then getOrMakeTool(sg).Name = string.format("%s x%d", TOOL_BASE, countVal) end
+
 	if countVal <= 0 then
-		-- remove the tool when zero
-		if bp then
-			for _, t in ipairs(bp:GetChildren()) do
-				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
-			end
-		end
-		local sg2 = plr:FindFirstChild("StarterGear")
-		if sg2 then
-			for _, t in ipairs(sg2:GetChildren()) do
-				if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end
-			end
-		end
+		if bp then for _, t in ipairs(bp:GetChildren()) do if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end end end
+		if sg then for _, t in ipairs(sg:GetChildren()) do if t:IsA("Tool") and t.Name:match("^"..TOOL_BASE) then t:Destroy() end end end
 	end
 end
 
@@ -73,15 +43,20 @@ Players.PlayerAdded:Connect(function(plr)
 	end)
 end)
 
--- Collect: E on a Plank -> +1 count, delete world plank
 PPS.PromptTriggered:Connect(function(prompt, plr)
 	if prompt.Name ~= "PickUpPlank" then return end
-	local part = prompt.Parent
-	if not part or not part:IsA("BasePart") or part.Name ~= "Plank" then return end
+	local host = prompt.Parent
+	if not host or not host:IsA("BasePart") then return end
+	local model = host:FindFirstAncestorOfClass("Model")
+
+	-- Only accept world planks inside workspace.Planks named "Plank"
+	if not host:IsDescendantOf(workspace.Planks) then return end
+	if not (host.Name == "Plank" or (model and model.Name == "Plank")) then return end
 
 	local _, count = ensureInventory(plr)
 	count.Value += 1
 	updateTool(plr, count.Value)
 
-	part:Destroy()
+	-- Remove the world plank object
+	if model and model.Name == "Plank" then model:Destroy() else host:Destroy() end
 end)
