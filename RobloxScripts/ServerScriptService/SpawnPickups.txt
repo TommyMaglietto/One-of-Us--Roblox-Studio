@@ -1,8 +1,7 @@
 -- ServerScriptService/SpawnPickupsOnStumps.server.lua
 -- Keys: exactly 5 random stumps get a Key
--- Remaining stumps: 9Volt 40%, Ammo 20%, None 30%
--- Placement: centered on stump top, upright, collision-aware lifting
--- Tweaks: Ammo is lowered by 0.229 studs; optional stump Attachment "PlaceHere" for exact centering
+-- Non-key roll per stump: 9Volt 40 percent, Bandages 33 percent, Ammo 10 percent, None 17 percent
+-- This version surface-locks items so they sit perfectly on top of each stump using a downward raycast
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
@@ -20,33 +19,42 @@ do
 	for _ = 1, 5 do math.random() end
 end
 
--- Non-key outcomes for the "other" stumps
+-- Non-key outcomes for the other stumps must cover 1..100
 local NON_KEY_RANGES = {
-	{ name = "9Volt", low = 1,  high = 40 },
-	{ name = "Ammo",  low = 41, high = 60 },
-	{ name = "None",  low = 61, high = 100 },
+	{ name = "9Volt",    low = 1,   high = 40 },  -- 40 percent
+	{ name = "Bandages", low = 41,  high = 73 },  -- 33 percent
+	{ name = "Ammo",     low = 74,  high = 83 },  -- 10 percent
+	{ name = "None",     low = 84,  high = 100 }, -- 17 percent
 }
 
--- Per-item placement offsets (local to the item, applied after centering)
+-- Per-item local offsets and rotations applied after centering
 -- Positive Y raises, negative Y lowers
 local ITEM_OFFSETS = {
-	Ammo = Vector3.new(0, -0.229, 0), -- lower the ammo box as requested
-	-- Key  = Vector3.new(0, 0, 0),
-	-- ["9Volt"] = Vector3.new(0, 0, 0),
+	Ammo      = Vector3.new(0, 0, 0), -- keep as requested; set to Vector3.new() if you want exact flush
+	Bandages  = Vector3.new(0, 0, 0),
+	["9Volt"] = Vector3.new(0, .38, 0),
+	Key       = Vector3.new(0, 0, 0),
+}
+
+-- Optional extra rotation for specific items (degrees)
+local ITEM_ROTATIONS = {
+	Bandages = Vector3.new(0, 0, 0), -- set e.g. Vector3.new(0, 90, 0) if you want a 90 degree yaw
 }
 
 -- Placement tuning
-local CLEARANCE_Y     = 0.05
-local MAX_LIFT_TRIES  = 10
-local LIFT_STEP       = 0.15
+local CLEARANCE_Y     = 0.0      -- zero so items rest exactly on the top surface
+local MAX_LIFT_TRIES  = 5        -- small safety lift only if intersecting non-stump parts
+local LIFT_STEP       = 0.02
 local ADD_RANDOM_YAW  = true
-
--- If present on a stump (anywhere under it), this Attachment's WorldCFrame determines the XZ center.
--- We still keep the item upright and compute Y so it "rests" on the surface.
 local STUMP_MARKER_NAME = "PlaceHere"
 
-local overlapParams = OverlapParams.new()
-overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+-- Overlap checks should ignore the clone, the chosen stump, and terrain
+local function makeOverlapParams(ignoreList)
+	local p = OverlapParams.new()
+	p.FilterType = Enum.RaycastFilterType.Exclude
+	p.FilterDescendantsInstances = ignoreList
+	return p
+end
 
 ---------------------------------------------------------------------
 -- Helpers
@@ -89,7 +97,7 @@ local function getStumpTopPart(stump)
 	return topPart
 end
 
--- Optional precision centering: Attachment named PlaceHere anywhere under stump
+-- Optional precision centering via Attachment named PlaceHere anywhere under stump
 local function findStumpMarker(stump)
 	if stump:IsA("Attachment") and stump.Name == STUMP_MARKER_NAME then
 		return stump
@@ -100,64 +108,91 @@ local function findStumpMarker(stump)
 	return nil
 end
 
--- Build an upright CFrame centered over the stump's top.
--- If a "PlaceHere" Attachment exists, use its XZ for centering.
-local function buildTargetCFrame(stump, itemModel)
+-- Raycast straight down at XZ to find the true top surface Y of this stump
+local function raycastTopY(stump, x, z)
+	local topPart = getStumpTopPart(stump)
+	local startY = topPart and (topPart.Position.Y + topPart.Size.Y + 10) or (Workspace.FallenPartsDestroyHeight + 1000)
+	local origin = Vector3.new(x, startY, z)
+	local direction = Vector3.new(0, -2000, 0)
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Include
+	rp.FilterDescendantsInstances = { stump }
+
+	local hit = Workspace:Raycast(origin, direction, rp)
+	if hit then
+		return hit.Position.Y
+	end
+
+	-- Fallback to simple top plane if raycast missed
+	if topPart then
+		return topPart.Position.Y + topPart.Size.Y * 0.5
+	end
+
+	-- Last resort
+	return origin.Y - 10
+end
+
+local function anglesFromDegrees(degVec)
+	return CFrame.Angles(math.rad(degVec.X), math.rad(degVec.Y), math.rad(degVec.Z))
+end
+
+-- Build a CFrame whose bottom sits exactly on the stump top at the chosen XZ
+local function buildSurfaceLockedCF(stump, itemModel)
 	local yawDegrees = ADD_RANDOM_YAW and math.random(0, 359) or 0
-	local yaw = CFrame.Angles(0, math.rad(yawDegrees), 0)
+	local baseYaw = CFrame.Angles(0, math.rad(yawDegrees), 0)
 
-	local _, itemSize = itemModel:GetBoundingBox()
-
-	-- Prefer artist marker if present
+	-- decide XZ center
 	local marker = findStumpMarker(stump)
+	local cx, cz
 	if marker and marker:IsA("Attachment") then
-		local posXZ = marker.WorldPosition
-		-- Compute surface top Y from the nearest top surface we know about
-		local topPart = getStumpTopPart(stump)
-		if topPart then
-			local topY = topPart.Position.Y + topPart.Size.Y * 0.5
-			local pos = Vector3.new(posXZ.X, topY + itemSize.Y * 0.5 + CLEARANCE_Y, posXZ.Z)
-			return CFrame.new(pos) * yaw
+		cx, cz = marker.WorldPosition.X, marker.WorldPosition.Z
+	else
+		local tp = getStumpTopPart(stump)
+		if tp then
+			cx, cz = tp.Position.X, tp.Position.Z
 		else
-			-- Fallback: rest on marker Y even without topPart, still keep upright
-			local pos = Vector3.new(posXZ.X, posXZ.Y + itemSize.Y * 0.5 + CLEARANCE_Y, posXZ.Z)
-			return CFrame.new(pos) * yaw
+			local stumpCF = stump:IsA("Model") and select(1, stump:GetBoundingBox()) or stump.CFrame
+			cx, cz = stumpCF.Position.X, stumpCF.Position.Z
 		end
 	end
 
-	-- Auto centering: use the highest BasePart top center
-	local topPart = getStumpTopPart(stump)
-	if topPart then
-		local topY = topPart.Position.Y + topPart.Size.Y * 0.5
-		local pos = Vector3.new(topPart.Position.X, topY + itemSize.Y * 0.5 + CLEARANCE_Y, topPart.Position.Z)
-		return CFrame.new(pos) * yaw
+	-- rotate the item first to get correct world height
+	local itemCFForSize = CFrame.new(0, 0, 0) * baseYaw
+	local _, itemSize = itemModel:GetBoundingBox()
+	-- yaw does not change Y size, but future per-item rotations might. Apply them here virtually:
+	local extraRot = ITEM_ROTATIONS[itemModel.Name]
+	if extraRot then
+		itemCFForSize = itemCFForSize * anglesFromDegrees(extraRot)
 	end
+	-- We cannot query size after virtual rotation without moving the instance,
+	-- but yaw keeps Y extent unchanged. Extra rotations are small; we will still surface-lock via raycast Y.
 
-	-- Bounding-box fallback
-	if stump:IsA("Model") then
-		local stumpCF, stumpSize = stump:GetBoundingBox()
-		local y = stumpCF.Position.Y + stumpSize.Y * 0.5 + itemSize.Y * 0.5 + CLEARANCE_Y
-		return CFrame.new(Vector3.new(stumpCF.Position.X, y, stumpCF.Position.Z)) * yaw
-	elseif stump:IsA("BasePart") then
-		local y = stump.Position.Y + stump.Size.Y * 0.5 + itemSize.Y * 0.5 + CLEARANCE_Y
-		return CFrame.new(Vector3.new(stump.Position.X, y, stump.Position.Z)) * yaw
+	local topY = raycastTopY(stump, cx, cz)
+	local targetY = topY + (itemSize.Y * 0.5) + CLEARANCE_Y
+
+	local cf = CFrame.new(Vector3.new(cx, targetY, cz)) * baseYaw
+	-- apply per-item rotation and offset
+	if extraRot then
+		cf = cf * anglesFromDegrees(extraRot)
 	end
-
-	return CFrame.new(0, itemSize.Y, 0) * yaw
+	local off = ITEM_OFFSETS[itemModel.Name]
+	if off then
+		cf = cf * CFrame.new(off)
+	end
+	return cf
 end
 
 -- Check overlap at a proposed placement
 local function isOverlappingAtCF(targetCF, itemModel, ignoreList)
 	local _, size = itemModel:GetBoundingBox()
-	overlapParams.FilterDescendantsInstances = ignoreList
-	local hits = workspace:GetPartBoundsInBox(targetCF, size, overlapParams)
+	local hits = Workspace:GetPartBoundsInBox(targetCF, size, makeOverlapParams(ignoreList))
 	return (#hits > 0)
 end
 
--- Lift slightly until not intersecting
+-- Small safety lift only if intersecting with non-stump parts
 local function safePivotTo(clone, baseCF, stump)
-	local ignoreList = { clone }
-	if stump then table.insert(ignoreList, stump) end
+	local ignoreList = { clone, stump, Workspace.Terrain }
 
 	local cf = baseCF
 	for _ = 1, MAX_LIFT_TRIES do
@@ -168,20 +203,11 @@ local function safePivotTo(clone, baseCF, stump)
 		cf = cf + Vector3.new(0, LIFT_STEP, 0)
 	end
 	clone:PivotTo(cf)
-	warn(("Pickup %s placed but still intersecting after max lifts"):format(clone.Name))
+	warn(("Pickup %s placed but may still be intersecting after max lifts"):format(clone.Name))
 	return false
 end
 
--- Build final CF with per-item offset (Ammo lowered 0.229)
-local function applyItemOffset(baseCF, itemName)
-	local offset = ITEM_OFFSETS[itemName]
-	if offset then
-		return baseCF * CFrame.new(offset)
-	end
-	return baseCF
-end
-
--- Place a specific item on a stump with all the rules
+-- Place a specific item on a stump with all rules
 local function placePickupOnStump(itemName, stump)
 	local src = PICKUPS_SOURCE:FindFirstChild(itemName)
 	if not src then
@@ -194,9 +220,8 @@ local function placePickupOnStump(itemName, stump)
 
 	if clone:IsA("Model") then ensurePrimaryPart(clone) end
 
-	local baseCF = buildTargetCFrame(stump, clone)
-	local finalCF = applyItemOffset(baseCF, itemName) -- e.g., Ammo lowered here
-	safePivotTo(clone, finalCF, stump)
+	local targetCF = buildSurfaceLockedCF(stump, clone)
+	safePivotTo(clone, targetCF, stump)
 end
 
 local function pickNonKeyOutcome()

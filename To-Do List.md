@@ -11,13 +11,13 @@ CORE CONTENT IMPORTS
 ENVIRONMENT & LEVEL DESIGN
 - Remake Farmhouse and Cabins
 - Add Directions/Instructions in Lobby
+- Add music to the lobby
 
 PLAYER SYSTEMS
 - Player Stats (health, stamina, sanity)
 - Player Upgrades to Stats
 - Upgrade System from Perks
 - Inventory System (items, bandages, flashlight)
-- Sprinting System
 - Healing System (uses bandages)
 - Healing Animations
 - Lay Down Animation
