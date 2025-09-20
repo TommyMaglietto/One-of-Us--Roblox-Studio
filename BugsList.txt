@@ -1,2 +1,5 @@
 Mobile Flashlight too jittery
 PC Flashlight too jittery
+fix generator continuing after leaving
+one of the tools disappears whenever repair the generator on mobile
+	

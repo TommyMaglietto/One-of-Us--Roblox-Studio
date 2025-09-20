@@ -1,0 +1,18 @@
+local isOn = true
+local tool = script.Parent
+local neon = tool:WaitForChild("Neon")
+
+script.Parent.Activated:Connect(function()
+	if isOn then
+		isOn = false
+		-- TOOL lights (directly under the tool)
+		script.Parent.LightPart.Ring.Enabled = false
+		neon.Transparency = 1
+	else
+		isOn = true
+		-- TOOL lights
+		script.Parent.LightPart.Ring.Enabled = true
+		neon.Transparency = 0
+	end
+	script.Parent.Toggle:Play()
+end)

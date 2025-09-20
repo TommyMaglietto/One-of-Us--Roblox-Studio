@@ -1,0 +1,38 @@
+local isOn = true
+local plr = game.Players.LocalPlayer
+local cam = game.Workspace.CurrentCamera
+local RunService = game:GetService("RunService")
+
+-- always hide the TOOL's lights locally so you only see the viewmodel beam
+local function hideServerLights()
+	local tool = script.Parent
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("SpotLight") or d:IsA("SurfaceLight") or d:IsA("PointLight") then
+			d.Enabled = false
+		end
+	end
+end
+
+script.Parent.Activated:Connect(function()
+	if isOn then
+		isOn = false
+		-- VIEWMODEL lights
+		cam["FlashLight viewmodel"].LightPart.Ring.Enabled = false
+	else
+		isOn = true
+		-- VIEWMODEL lights
+		cam["FlashLight viewmodel"].LightPart.Ring.Enabled = true
+	end
+	hideServerLights() -- make sure the server/tool beam is off for the owner
+end)
+
+-- also hide on equip and every frame while equipped (covers server re-enables)
+script.Parent.Equipped:Connect(function()
+	hideServerLights()
+end)
+
+RunService.RenderStepped:Connect(function()
+	if script.Parent.Parent == plr.Character then
+		hideServerLights()
+	end
+end)
