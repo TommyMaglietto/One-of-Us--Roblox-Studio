@@ -11,10 +11,17 @@ local GenProgress = Remotes:WaitForChild("GenProgress")
 local QTEPrompt   = Remotes:WaitForChild("QTEPrompt")
 local Config      = require(GenFolder:WaitForChild("GenConfig"))
 
--- state per generator:
--- state = { model, progress, running, lastTick, completed, workers = { [player] = {player, failLockUntil, nextQTEAt, qteActive, qteId, qteStart, qteDuration, zoneCenter} } }
+-- Expected in Config
+-- MaxProgress, BaseRatePerPlayer, MaxWorkers, ServerStep
+-- QTE_IntervalMin, QTE_IntervalMax, QTE_ZoneWidth, QTE_FillSpeed, QTE_ServerGrace
+-- QTE_SuccessBonus, FailPenalty, FailLockout
+-- WrenchMultiplier
+-- RepairRadius
+-- MaxServerDelta  optional safety clamp for dt spikes
+
 local GenStates = {}
 
+-- ------------- helpers -------------
 local function toolMult(player)
 	local char = player.Character
 	if not char then return 1.0 end
@@ -26,6 +33,30 @@ local function toolMult(player)
 	return 1.0
 end
 
+local function getGenPosition(model)
+	if model.PrimaryPart then
+		return model.PrimaryPart.Position
+	end
+	local ok1, cf = pcall(function() return model:GetPivot() end)
+	if ok1 and cf then return cf.Position end
+	local ok2, bboxCF = pcall(function() return select(1, model:GetBoundingBox()) end)
+	return (ok2 and bboxCF and bboxCF.Position) or Vector3.zero
+end
+
+local function getPlayerPosition(plr)
+	local char = plr.Character
+	if not char then return nil end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	return hrp and hrp.Position or nil
+end
+
+local function inRepairRadius(plr, genModel)
+	local pPos = getPlayerPosition(plr)
+	if not pPos then return false end
+	local gPos = getGenPosition(genModel)
+	return (pPos - gPos).Magnitude <= (Config.RepairRadius or 12)
+end
+
 local function ensureState(model)
 	local s = GenStates[model]
 	if s then return s end
@@ -33,7 +64,7 @@ local function ensureState(model)
 		model     = model,
 		progress  = model:GetAttribute("Progress") or 0,
 		running   = false,
-		lastTick  = time(),
+		lastTick  = nil,   -- will be set when loop starts
 		completed = false,
 		workers   = {},
 	}
@@ -42,42 +73,80 @@ local function ensureState(model)
 	return s
 end
 
-local function pushProgress(state)
+local function pushProgress(state, who, note)
+	if who then
+		GenProgress:FireClient(who, state.model, state.progress, Config.MaxProgress, note)
+		return
+	end
 	for plr in pairs(state.workers) do
-		GenProgress:FireClient(plr, state.model, state.progress, Config.MaxProgress)
+		GenProgress:FireClient(plr, state.model, state.progress, Config.MaxProgress, note)
 	end
 end
 
 local function scheduleNextQTE(w)
-	w.nextQTEAt = time() + math.random() * (Config.QTE_IntervalMax - Config.QTE_IntervalMin) + Config.QTE_IntervalMin
+	w.nextQTEAt = time()
+		+ math.random() * (Config.QTE_IntervalMax - Config.QTE_IntervalMin)
+		+ Config.QTE_IntervalMin
 end
 
+local function stopWorker(state, plr, note)
+	local w = state.workers[plr]
+	if not w then return end
+	w.qteActive = false
+	w.qteId = nil
+	state.workers[plr] = nil
+	pushProgress(state, plr, note or "left")
+end
+
+-- ------------- main loop -------------
 local function startLoop(state)
 	if state.running then return end
 	state.running = true
+	state.lastTick = time()  -- critical: reset timing at loop start
+
 	task.spawn(function()
 		while state.running do
 			local now = time()
-			local dt  = now - (state.lastTick or now)
+			local dt  = state.lastTick and (now - state.lastTick) or 0
 			state.lastTick = now
+
+			-- clamp dt to avoid any single tick adding large progress
+			local maxDelta = Config.MaxServerDelta or 0.25
+			if dt > maxDelta then dt = maxDelta end
+
+			-- remove workers who left radius or lost HRP
+			if next(state.workers) ~= nil then
+				local toRemove = {}
+				for plr in pairs(state.workers) do
+					if not inRepairRadius(plr, state.model) or not getPlayerPosition(plr) then
+						table.insert(toRemove, plr)
+					end
+				end
+				for _, plr in ipairs(toRemove) do
+					stopWorker(state, plr, "left")
+				end
+			end
 
 			-- stop if no workers
 			local count = 0 for _ in pairs(state.workers) do count += 1 end
 			if count == 0 then
 				state.running = false
+				state.lastTick = nil   -- critical: clear timing so dt resumes at zero next start
 				break
 			end
 
-			-- accumulate progress
-			if not state.completed then
-				local total = 0
+			-- progress accumulation
+			if not state.completed and dt > 0 then
+				local totalMult = 0
 				for plr, w in pairs(state.workers) do
 					local mult = toolMult(plr)
-					if w.failLockUntil and now < w.failLockUntil then mult = 0 end
-					total += mult
+					if w.failLockUntil and now < w.failLockUntil then
+						mult = 0
+					end
+					totalMult += mult
 				end
-				if total > 0 then
-					local perSec = Config.BaseRatePerPlayer * total
+				if totalMult > 0 then
+					local perSec = Config.BaseRatePerPlayer * totalMult
 					state.progress = math.clamp(state.progress + perSec * dt, 0, Config.MaxProgress)
 					state.model:SetAttribute("Progress", state.progress)
 					pushProgress(state)
@@ -88,37 +157,40 @@ local function startLoop(state)
 				end
 			end
 
-			-- QTE lifecycle (no overlap)
-			for _, w in pairs(state.workers) do
-				if w.qteActive then
-					local deadline = (w.qteStart or now) + (w.qteDuration or 0) + Config.QTE_ServerGrace
-					if now >= deadline then
-						-- timeout -> fail
-						if not state.completed then
-							state.progress = math.clamp(state.progress - Config.FailPenalty, 0, Config.MaxProgress)
-							state.model:SetAttribute("Progress", state.progress)
-							pushProgress(state)
-						end
-						w.failLockUntil = now + Config.FailLockout
-						w.qteActive = false
-						scheduleNextQTE(w)
-					end
+			-- QTE lifecycle managed per worker
+			for plr, w in pairs(state.workers) do
+				-- guard again in case someone drifted out very recently
+				if not inRepairRadius(plr, state.model) then
+					stopWorker(state, plr, "left")
 				else
-					if not w.nextQTEAt then
-						w.nextQTEAt = now + 1.0 -- first prompt quickly after starting
-					elseif now >= w.nextQTEAt and not state.completed then
-						w.qteId       = (w.qteId or 0) + 1
-						w.qteStart    = now
-						w.qteDuration = Config.QTE_FillSpeed
-						w.zoneCenter  = math.random() * (1 - Config.QTE_ZoneWidth) + (Config.QTE_ZoneWidth * 0.5)
-						w.qteActive   = true
-						QTEPrompt:FireClient(w.player, state.model, {
-							id         = w.qteId,
-							duration   = w.qteDuration,
-							zoneCenter = w.zoneCenter,
-							zoneWidth  = Config.QTE_ZoneWidth,
-						})
-						-- wait for result/timeout before scheduling the next
+					if w.qteActive then
+						local deadline = (w.qteStart or now) + (w.qteDuration or 0) + Config.QTE_ServerGrace
+						if now >= deadline then
+							if not state.completed then
+								state.progress = math.clamp(state.progress - Config.FailPenalty, 0, Config.MaxProgress)
+								state.model:SetAttribute("Progress", state.progress)
+								pushProgress(state)
+							end
+							w.failLockUntil = now + Config.FailLockout
+							w.qteActive = false
+							scheduleNextQTE(w)
+						end
+					else
+						if not w.nextQTEAt then
+							w.nextQTEAt = now + 1.0
+						elseif now >= w.nextQTEAt and not state.completed then
+							w.qteId       = (w.qteId or 0) + 1
+							w.qteStart    = now
+							w.qteDuration = Config.QTE_FillSpeed
+							w.zoneCenter  = math.random() * (1 - Config.QTE_ZoneWidth) + (Config.QTE_ZoneWidth * 0.5)
+							w.qteActive   = true
+							QTEPrompt:FireClient(w.player, state.model, {
+								id         = w.qteId,
+								duration   = w.qteDuration,
+								zoneCenter = w.zoneCenter,
+								zoneWidth  = Config.QTE_ZoneWidth,
+							})
+						end
 					end
 				end
 			end
@@ -128,17 +200,27 @@ local function startLoop(state)
 	end)
 end
 
+-- ------------- events -------------
 StartRepair.OnServerEvent:Connect(function(player, genModel)
 	if typeof(genModel) ~= "Instance" or not genModel:IsDescendantOf(workspace) then return end
+
+	-- must be inside radius to start
+	if not inRepairRadius(player, genModel) then
+		local statePeek = ensureState(genModel)
+		pushProgress(statePeek, player, "too_far")
+		return
+	end
+
 	local state = ensureState(genModel)
 
 	-- capacity
 	local c = 0 for _ in pairs(state.workers) do c += 1 end
 	if c >= Config.MaxWorkers then
-		GenProgress:FireClient(player, genModel, state.progress, Config.MaxProgress, "full")
+		pushProgress(state, player, "full")
 		return
 	end
 
+	-- register worker
 	local w = state.workers[player]
 	if not w then
 		w = { player = player }
@@ -148,14 +230,17 @@ StartRepair.OnServerEvent:Connect(function(player, genModel)
 	w.qteActive     = false
 	w.nextQTEAt     = time() + 1.0
 
-	GenProgress:FireClient(player, genModel, state.progress, Config.MaxProgress)
+	-- send snapshot
+	pushProgress(state, player)
+
+	-- start or resume loop
 	startLoop(state)
 end)
 
 StopRepair.OnServerEvent:Connect(function(player, genModel)
 	local state = GenStates[genModel]
 	if not state then return end
-	state.workers[player] = nil
+	stopWorker(state, player, "stopped")
 end)
 
 QTEResult.OnServerEvent:Connect(function(player, genModel, payload)
@@ -163,12 +248,18 @@ QTEResult.OnServerEvent:Connect(function(player, genModel, payload)
 	if not state then return end
 	local w = state.workers[player]
 	if not w or type(payload) ~= "table" then return end
+
+	-- ignore results if the player left the radius
+	if not inRepairRadius(player, genModel) then
+		stopWorker(state, player, "left")
+		return
+	end
+
 	if not w.qteActive or payload.id ~= w.qteId then return end
 
 	local now = time()
 	local grace = Config.QTE_ServerGrace
 	if not w.qteStart or not w.qteDuration or (now - w.qteStart) > (w.qteDuration + grace) then
-		-- expired; ignore and reschedule
 		w.qteActive = false
 		scheduleNextQTE(w)
 		return
@@ -191,6 +282,6 @@ end)
 
 Players.PlayerRemoving:Connect(function(plr)
 	for _, state in pairs(GenStates) do
-		state.workers[plr] = nil
+		stopWorker(state, plr)
 	end
 end)
