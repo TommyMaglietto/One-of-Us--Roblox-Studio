@@ -1,0 +1,369 @@
+-- ServerScriptService/ToolSpawner.server.lua
+-- Weighted spawner with face placement, per-tool rotation, and SawedOff no-respawn
+
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local WorkspaceService   = game:GetService("Workspace")
+
+-- Folders and modules
+local RS_ToolsFolder     = ReplicatedStorage:WaitForChild("Tools")
+local RS_SystemFolder    = ReplicatedStorage:WaitForChild("ToolSpawnSystem")
+local RS_Modules         = RS_SystemFolder:WaitForChild("Modules")
+local WeightedChooser    = require(RS_Modules:WaitForChild("WeightedChooser"))
+
+-- World folders
+local WS_SpawnRoot       = WorkspaceService:WaitForChild("ToolSpawnPoints")
+local WS_SpawnedTools    = WorkspaceService:FindFirstChild("SpawnedTools") or Instance.new("Folder")
+WS_SpawnedTools.Name     = "SpawnedTools"
+WS_SpawnedTools.Parent   = WorkspaceService
+
+-- RNG variety for any fallback picks
+do
+	math.randomseed(tick() % 1e6)
+	for _ = 1, 5 do math.random() end
+end
+
+-- Defaults for spawn Part attributes if missing on a Part
+local DEFAULTS = {
+	Weight = 15,           -- higher means more likely to be chosen
+	RespawnDelay = 60,     -- seconds
+	Face = "Top",          -- Top Bottom Front Back Left Right
+	HeightOffset = 0.05,   -- studs outward from that face to prevent z-fighting
+	Enabled = true,        -- include this point if true
+}
+
+-- Per tool configuration
+-- Rotation offsets are applied ONLY to that tool
+-- RespawnAllowed controls whether that tool can ever respawn
+local TOOL_CONFIG = {
+	Bandages = {
+		SpawnCount = 3,
+		RespawnMode = "SAME",        -- SAME or RANDOM
+		RespawnAllowed = true,       -- Bandages can respawn
+		YawOffsetDeg = 0,            -- around Y
+		PitchOffsetDeg = 0,          -- around X
+		RollOffsetDeg = 0,           -- around Z
+	},
+	Wrench = {
+		SpawnCount = 3,
+		RespawnMode = "SAME",
+		RespawnAllowed = true,
+		YawOffsetDeg = 90,
+		PitchOffsetDeg = 0,
+		RollOffsetDeg = -90,
+	},
+	SawedOff = {
+		SpawnCount = 1,              -- always spawn 1
+		ExtraSpawnChance = 0.5,     -- 35% chance to spawn a 2nd one (weighted, different spot)
+		RespawnMode = "SAME",
+		RespawnAllowed = false,      -- never respawn this tool
+		YawOffsetDeg = 0,
+		PitchOffsetDeg = 90,
+		RollOffsetDeg = 0,
+	},
+}
+
+-- Helpers for attributes on spawn Parts
+local function getAttr(instance, name, defaultValue)
+	local v = instance:GetAttribute(name)
+	if v == nil then return defaultValue end
+	return v
+end
+
+local function ensureDefaultAttrs(spawnPart)
+	for name, def in pairs(DEFAULTS) do
+		if spawnPart:GetAttribute(name) == nil then
+			spawnPart:SetAttribute(name, def)
+		end
+	end
+end
+
+-- Placement math
+local function computeFaceCFrame(spawnPart, faceName, heightOffset)
+	faceName = tostring(faceName or "Top")
+	heightOffset = tonumber(heightOffset or 0.05) or 0.05
+
+	local cf = spawnPart.CFrame
+	local right = cf.RightVector
+	local up    = cf.UpVector
+	local look  = cf.LookVector
+	local size  = spawnPart.Size
+
+	local normal, half
+	if faceName == "Top" then
+		normal = up;       half = size.Y * 0.5
+	elseif faceName == "Bottom" then
+		normal = -up;      half = size.Y * 0.5
+	elseif faceName == "Front" then
+		normal = look;     half = size.Z * 0.5
+	elseif faceName == "Back" then
+		normal = -look;    half = size.Z * 0.5
+	elseif faceName == "Right" then
+		normal = right;    half = size.X * 0.5
+	elseif faceName == "Left" then
+		normal = -right;   half = size.X * 0.5
+	else
+		normal = up;       half = size.Y * 0.5
+	end
+
+	local basePos = spawnPart.Position + normal * (half + heightOffset)
+
+	local toolUp, toolRight
+	if faceName == "Top" or faceName == "Bottom" then
+		toolUp = normal
+		toolRight = right
+	else
+		toolUp = up
+		toolRight = normal
+	end
+
+	return CFrame.fromMatrix(basePos, toolRight, toolUp)
+end
+
+local function rotationFromDegrees(pitchDeg, yawDeg, rollDeg)
+	local x = math.rad(tonumber(pitchDeg or 0) or 0)
+	local y = math.rad(tonumber(yawDeg   or 0) or 0)
+	local z = math.rad(tonumber(rollDeg  or 0) or 0)
+	return CFrame.Angles(x, y, z)
+end
+
+-- Attach ProximityPrompt and give backpack copy on pickup
+local function attachPromptAndConnect(worldTool, toolName, respawnDelay, respawnMode, spawnPart, perTool)
+	local handle = worldTool:FindFirstChild("Handle")
+	if not handle or not handle:IsA("BasePart") then
+		warn("World tool missing Handle for " .. toolName)
+		return
+	end
+
+	local prompt = handle:FindFirstChildOfClass("ProximityPrompt")
+	if not prompt then
+		prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "PickupPrompt"
+		prompt.ObjectText = toolName
+		prompt.ActionText = "Pick up"
+		prompt.KeyboardKeyCode = Enum.KeyCode.E
+		prompt.HoldDuration = 0.05
+		prompt.MaxActivationDistance = 10
+		prompt.RequiresLineOfSight = false
+		prompt.Parent = handle
+	end
+
+	local locked = false
+	prompt.Triggered:Connect(function(player)
+		if locked then return end
+		locked = true
+		if not worldTool or not worldTool.Parent then return end
+
+		local sourceTool = RS_ToolsFolder:FindFirstChild(toolName)
+		if not sourceTool or not sourceTool:IsA("Tool") then
+			warn("Source Tool not found for " .. toolName)
+			return
+		end
+
+		local granted = sourceTool:Clone()
+		local backpack = player:FindFirstChildOfClass("Backpack")
+		if not backpack then
+			backpack = Instance.new("Backpack")
+			backpack.Name = "Backpack"
+			backpack.Parent = player
+		end
+		local gh = granted:FindFirstChild("Handle")
+		if gh and gh:IsA("BasePart") then
+			gh.Anchored = false
+			gh.CanCollide = false
+		end
+		granted.Parent = backpack
+
+		worldTool:Destroy()
+
+		-- If this tool is not allowed to respawn, stop here
+		if perTool and perTool.RespawnAllowed == false then
+			return
+		end
+
+		-- Respect per spot delay unless tool is set to no-respawn
+		if respawnDelay and respawnDelay > 0 then
+			task.delay(respawnDelay, function()
+				if respawnMode == "SAME" then
+					-- Placeholder for SAME-spot respawn hook
+				else
+					-- RANDOM respawn within the same tool's folder
+					local toolFolder = WS_SpawnRoot:FindFirstChild(toolName)
+					if toolFolder then
+						local parts, weights = {}, {}
+						for _, p in ipairs(toolFolder:GetChildren()) do
+							if p:IsA("BasePart") and getAttr(p, "Enabled", DEFAULTS.Enabled) ~= false then
+								table.insert(parts, p)
+								table.insert(weights, tonumber(getAttr(p, "Weight", DEFAULTS.Weight)) or DEFAULTS.Weight)
+							end
+						end
+						local idx = WeightedChooser.pickIndex(weights)
+						if idx and parts[idx] then
+							_G.__ToolSpawn_Reentry(toolName, parts[idx])
+						end
+					end
+				end
+			end)
+		end
+	end)
+end
+
+-- Collect enabled spawn Parts and weights for a tool
+local function collectSpawns(toolName)
+	local folder = WS_SpawnRoot:FindFirstChild(toolName)
+	if not folder then return {}, {} end
+
+	local parts, weights = {}, {}
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("BasePart") then
+			ensureDefaultAttrs(child)
+			if getAttr(child, "Enabled", DEFAULTS.Enabled) ~= false then
+				table.insert(parts, child)
+				table.insert(weights, tonumber(getAttr(child, "Weight", DEFAULTS.Weight)) or DEFAULTS.Weight)
+			end
+		end
+	end
+	return parts, weights
+end
+
+-- Place a single world copy at a specific spawn Part for a tool
+local function spawnOneAt(toolName, spawnPart)
+	local sourceTool = RS_ToolsFolder:FindFirstChild(toolName)
+	if not sourceTool or not sourceTool:IsA("Tool") then
+		warn("Missing source Tool " .. tostring(toolName))
+		return
+	end
+	if not spawnPart or not spawnPart:IsA("BasePart") then
+		warn("spawnOneAt invalid spawnPart for " .. tostring(toolName))
+		return
+	end
+
+	ensureDefaultAttrs(spawnPart)
+
+	local perTool = TOOL_CONFIG[toolName] or {}
+	local faceName     = tostring(getAttr(spawnPart, "Face", DEFAULTS.Face))
+	local heightOffset = tonumber(getAttr(spawnPart, "HeightOffset", DEFAULTS.HeightOffset)) or DEFAULTS.HeightOffset
+	local respawnDelay = tonumber(getAttr(spawnPart, "RespawnDelay", DEFAULTS.RespawnDelay)) or DEFAULTS.RespawnDelay
+	local respawnMode  = perTool.RespawnMode or "SAME"
+
+	-- If this tool is configured to never respawn, force respawnDelay to 0
+	if perTool.RespawnAllowed == false then
+		respawnDelay = 0
+	end
+
+	local worldCopy = sourceTool:Clone()
+	worldCopy.Name = toolName .. "_World"
+
+	local handle = worldCopy:FindFirstChild("Handle")
+	if not handle or not handle:IsA("BasePart") then
+		warn("Tool " .. toolName .. " has no Handle")
+		worldCopy:Destroy()
+		return
+	end
+
+	-- Base placement CFrame on the requested face
+	local baseCF = computeFaceCFrame(spawnPart, faceName, heightOffset)
+
+	-- Apply per-tool rotation only
+	local rotCF = rotationFromDegrees(perTool.PitchOffsetDeg or 0, perTool.YawOffsetDeg or 0, perTool.RollOffsetDeg or 0)
+
+	handle.CFrame = baseCF * rotCF
+	handle.Anchored = true
+	handle.CanCollide = false
+
+	worldCopy.Parent = WS_SpawnedTools
+
+	attachPromptAndConnect(worldCopy, toolName, respawnDelay, respawnMode, spawnPart, perTool)
+end
+
+-- Weighted selection without replacement
+local function pickUniqueByWeight(weights, count)
+	local chosen = {}
+	local temp = table.clone(weights)
+	for _ = 1, count do
+		local idx = WeightedChooser.pickIndex(temp)
+		if not idx then break end
+		table.insert(chosen, idx)
+		temp[idx] = 0
+	end
+	return chosen
+end
+
+-- Same as above but ensures at least one index is returned if requested
+local function pickUniqueByWeightWithFallback(weights, count, mustAtLeastOne)
+	local chosen = pickUniqueByWeight(weights, count)
+
+	if mustAtLeastOne and (#chosen == 0) then
+		-- Prefer any index with weight > 0
+		local candidates = {}
+		for i, w in ipairs(weights) do
+			if (tonumber(w) or 0) > 0 then
+				table.insert(candidates, i)
+			end
+		end
+		local idx
+		if #candidates > 0 then
+			idx = candidates[math.random(1, #candidates)]
+		elseif #weights > 0 then
+			-- All weights were zero, just pick any valid slot
+			idx = math.random(1, #weights)
+		end
+		if idx then
+			table.insert(chosen, idx)
+		end
+	end
+
+	return chosen
+end
+
+-- Initial spawn for all tools per TOOL_CONFIG
+local function spawnAllConfigured()
+	for toolName, cfg in pairs(TOOL_CONFIG) do
+		local src = RS_ToolsFolder:FindFirstChild(toolName)
+		if not src or not src:IsA("Tool") then
+			warn("Skipping " .. toolName .. " because source Tool not found in ReplicatedStorage/Tools")
+		else
+			local parts, weights = collectSpawns(toolName)
+			if #parts == 0 then
+				warn("No spawn points found for " .. toolName .. " under Workspace/ToolSpawnPoints/" .. toolName)
+			else
+				-- Special handling for SawedOff:
+				--   1) Always spawn at least one (fallback-protected)
+				--   2) Then roll once for a weighted second spawn in a different spot
+				if toolName == "SawedOff" then
+					local firstPick = pickUniqueByWeightWithFallback(weights, 1, true)
+					if #firstPick > 0 then
+						spawnOneAt(toolName, parts[firstPick[1]])
+					end
+
+					local extraChance = tonumber(cfg.ExtraSpawnChance or 0) or 0
+					if extraChance > 0 and #parts > 1 and math.random() < extraChance then
+						local temp = table.clone(weights)
+						temp[firstPick[1]] = 0 -- ensure different spawn
+						local secondIdx = WeightedChooser.pickIndex(temp)
+						if secondIdx and parts[secondIdx] then
+							spawnOneAt(toolName, parts[secondIdx])
+						end
+					end
+				else
+					-- Default behavior for other tools (supports Wrench guarantee via fallback logic if needed)
+					local n = math.clamp(tonumber(cfg.SpawnCount or 1) or 1, 1, #parts)
+					local mustAtLeastOne = (toolName == "Wrench")
+					local selected = pickUniqueByWeightWithFallback(weights, n, mustAtLeastOne)
+					for _, idx in ipairs(selected) do
+						local part = parts[idx]
+						if part then
+							spawnOneAt(toolName, part)
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- A small global reentry hook for RANDOM respawns
+_G.__ToolSpawn_Reentry = function(toolName, spawnPart)
+	spawnOneAt(toolName, spawnPart)
+end
+
+spawnAllConfigured()
