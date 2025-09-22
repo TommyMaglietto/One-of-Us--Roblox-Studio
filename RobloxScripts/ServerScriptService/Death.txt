@@ -1,0 +1,27 @@
+local productID = 00000000 -- PRODUCT ID HERE
+local lobbyID = 84298927326376 --- LOBBY PLACE ID HERE
+
+game.ReplicatedStorage.BuyRespawn.OnServerEvent:Connect(function(player)
+	game.MarketplaceService:PromptProductPurchase(player, productID)
+end)
+
+game.MarketplaceService.PromptProductPurchaseFinished:Connect(function(id, product, purchased)
+	if product == productID and purchased then
+		game.Players:GetPlayerByUserId(id):LoadCharacter()
+	end
+end)
+
+game.ReplicatedStorage.BackToLobby.OnServerEvent:Connect(function(player)
+	game["Teleport Service"]:TeleportAsync(lobbyID, {player})
+end)
+
+game.Players.PlayerAdded:Connect(function(p)
+
+	p.CharacterAdded:Connect(function(c)
+		c:WaitForChild("Humanoid").Died:Connect(function()
+			task.wait(1)
+			game.ReplicatedStorage.BuyRespawn:FireClient(p)
+		end)
+	end)
+	p:LoadCharacter()
+end)

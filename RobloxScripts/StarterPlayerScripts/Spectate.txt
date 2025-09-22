@@ -1,0 +1,85 @@
+local RP = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local player = game.Players.LocalPlayer
+local camera = game.Workspace.CurrentCamera
+
+local Players = game:GetService("Players")
+
+local deathUI = player.PlayerGui:WaitForChild("Spectating")
+
+local respawnRemote = RP:WaitForChild("BuyRespawn")
+local leaveRemote = RP:WaitForChild("BackToLobby")
+
+local spectating = false
+
+RP.BuyRespawn.OnClientEvent:Connect(function()
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+
+	deathUI.Enabled = true
+	UserInputService.MouseIconEnabled = true
+	player.CameraMode = Enum.CameraMode.Classic
+	camera.CameraType = Enum.CameraType.Custom
+	player.CameraMaxZoomDistance = 14
+	player.CameraMinZoomDistance = 7
+
+	spectating = true
+end)
+
+
+player.CharacterAdded:Connect(function(char)
+	spectating = false
+	deathUI.Enabled = false
+
+	player.CameraMaxZoomDistance = 0
+	player.CameraMinZoomDistance = 0
+
+	player.CameraMode = Enum.CameraMode.LockFirstPerson
+end)
+
+deathUI.Buttons:WaitForChild("Respawn").MouseButton1Click:Connect(function()
+	respawnRemote:FireServer()
+end)
+
+deathUI.Buttons:WaitForChild("Leave").MouseButton1Click:Connect(function()
+	leaveRemote:FireServer()
+	deathUI.Buttons.Leave.Text = "Teleporting..."
+end)
+
+deathUI.Spectating:WaitForChild("Next").MouseButton1Click:Connect(function()
+	local pspec = Players:FindFirstChild(camera.CameraSubject.Parent.Name)
+
+	local playersList = Players:GetPlayers()
+
+	local currentIndex = table.find(playersList, pspec)
+	local totalPlayers = #playersList
+
+	if currentIndex then
+		currentIndex += 1
+		if currentIndex > totalPlayers then
+			currentIndex = 1
+		end
+
+		camera.CameraSubject = playersList[currentIndex].Character.Head
+	end
+end)
+
+deathUI.Spectating:WaitForChild("Back").MouseButton1Click:Connect(function()
+
+	local pspec = Players:FindFirstChild(camera.CameraSubject.Parent.Name)
+
+	local playersList = Players:GetPlayers()
+
+	local currentIndex = table.find(playersList, pspec)
+	local totalPlayers = #playersList
+
+	if currentIndex then
+		currentIndex -= 1
+		if currentIndex < 1 then
+			currentIndex = totalPlayers
+		end
+
+		camera.CameraSubject = playersList[currentIndex].Character.Head
+		
+	end
+end)

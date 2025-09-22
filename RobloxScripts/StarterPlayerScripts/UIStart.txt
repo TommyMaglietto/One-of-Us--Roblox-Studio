@@ -1,0 +1,7 @@
+local StarterGui = game:GetService("StarterGui")
+
+task.wait(1)
+
+for _, type in ipairs(Enum.CoreGuiType:GetEnumItems()) do
+	StarterGui:SetCoreGuiEnabled(type, false)
+end

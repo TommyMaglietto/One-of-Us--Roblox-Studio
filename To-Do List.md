@@ -6,8 +6,9 @@ CORE CONTENT IMPORTS
 - Import Creature Animations
 - 
 - Import Loading Screen
-- Import Bandages model
-
+LOBBY
+- add music
+- add sprinting
 ENVIRONMENT & LEVEL DESIGN
 - Remake Farmhouse and Cabins
 - Add Directions/Instructions in Lobby
@@ -37,7 +38,6 @@ MONSTER SYSTEMS
 - Monster Attack
 
 COMBAT & TOOLS
-- Random Tool Spawn System
 - Shotgun Animation (idle, reload, shoot)
 - Shotgun Shooting Mechanic
 - Shotgun Damage/Wounding
