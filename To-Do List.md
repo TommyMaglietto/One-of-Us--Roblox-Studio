@@ -22,7 +22,6 @@ PLAYER SYSTEMS
 - Healing System (uses bandages)
 - Healing Animations
 - Lay Down Animation
-- Spectator Function
 - Spectator UI
 - Random Assignment of Roles (survivor, monster, special roles)
 

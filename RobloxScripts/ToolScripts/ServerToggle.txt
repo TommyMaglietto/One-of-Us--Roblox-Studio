@@ -1,18 +1,101 @@
-local isOn = true
-local tool = script.Parent
-local neon = tool:WaitForChild("Neon")
+-- FlashlightServer.server.lua
 
-script.Parent.Activated:Connect(function()
-	if isOn then
-		isOn = false
-		-- TOOL lights (directly under the tool)
-		script.Parent.LightPart.Ring.Enabled = false
-		neon.Transparency = 1
-	else
-		isOn = true
-		-- TOOL lights
-		script.Parent.LightPart.Ring.Enabled = true
-		neon.Transparency = 0
+local tool = script.Parent
+
+-- Ensure IsOn attribute
+if tool:GetAttribute("IsOn") == nil then
+	tool:SetAttribute("IsOn", false)
+end
+
+-- Ensure Battery NumberValue
+local Battery = tool:FindFirstChild("Battery")
+if not Battery then
+	Battery = Instance.new("NumberValue")
+	Battery.Name = "Battery"
+	Battery.Value = 100
+	Battery.Parent = tool
+end
+
+-- RemoteEvent for client toggles
+local ToggleRequest = tool:FindFirstChild("ToggleRequest") or Instance.new("RemoteEvent")
+ToggleRequest.Name = "ToggleRequest"
+ToggleRequest.Parent = tool
+
+-- Visual refs
+local neon      = tool:FindFirstChild("Neon")
+local lightPart = tool:FindFirstChild("LightPart") or tool
+local ring      = lightPart and lightPart:FindFirstChild("Ring")
+local toggleSfx = tool:FindFirstChild("Toggle")  -- optional
+
+-- Tuning
+local DRAIN_PER_SEC    = 1.2
+local AUTO_OFF_AT_ZERO = true
+
+local function applyVisuals()
+	local on       = tool:GetAttribute("IsOn") == true
+	local hasJuice = Battery.Value > 0
+	if ring and ring:IsA("Light") then
+		ring.Enabled = on and hasJuice
 	end
-	script.Parent.Toggle:Play()
+	if neon and neon:IsA("BasePart") then
+		neon.Transparency = (on and hasJuice) and 0 or 1
+	end
+end
+
+local function setOn(on: boolean)
+	-- HARD BLOCK: never allow ON when battery is empty
+	if on and Battery.Value <= 0 then
+		on = false
+	end
+
+	if tool:GetAttribute("IsOn") ~= on then
+		tool:SetAttribute("IsOn", on)
+		if toggleSfx and toggleSfx:IsA("Sound") then
+			toggleSfx:Play()
+		end
+	end
+	applyVisuals()
+end
+
+local function ownsThisTool(plr)
+	local char = plr.Character
+	return char and tool.Parent == char
+end
+
+-- Client requests a toggle (desired true/false)
+ToggleRequest.OnServerEvent:Connect(function(plr, desired)
+	if not ownsThisTool(plr) then return end
+
+	-- Refuse turning ON with empty battery
+	if desired and Battery.Value <= 0 then
+		setOn(false)
+		return
+	end
+
+	setOn(desired == true)
 end)
+
+-- Drain loop: server-authoritative so UI (Battery.Changed) updates
+task.spawn(function()
+	while task.wait(0.2) do
+		if tool:GetAttribute("IsOn") and Battery.Value > 0 then
+			Battery.Value = math.clamp(Battery.Value - (DRAIN_PER_SEC * 0.2), 0, 100)
+			if Battery.Value <= 0 and AUTO_OFF_AT_ZERO then
+				setOn(false) -- enforce OFF immediately at zero
+			end
+			applyVisuals()
+		end
+	end
+end)
+
+-- If Battery changes (e.g., recharge), refresh visuals / enforce rule
+Battery.Changed:Connect(function()
+	if Battery.Value <= 0 and tool:GetAttribute("IsOn") then
+		setOn(false)
+	else
+		applyVisuals()
+	end
+end)
+
+-- Initial correction
+applyVisuals()

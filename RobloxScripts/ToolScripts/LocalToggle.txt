@@ -1,11 +1,16 @@
-local isOn = true
-local plr = game.Players.LocalPlayer
-local cam = game.Workspace.CurrentCamera
-local RunService = game:GetService("RunService")
+-- FlashlightClient.local.lua
 
--- always hide the TOOL's lights locally so you only see the viewmodel beam
+local tool       = script.Parent
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local cam        = workspace.CurrentCamera
+local plr        = Players.LocalPlayer
+
+local ToggleRequest = tool:WaitForChild("ToggleRequest")
+local Battery       = tool:WaitForChild("Battery") -- NumberValue
+
+-- Hide world/tool lights locally so owner only sees the viewmodel beam
 local function hideServerLights()
-	local tool = script.Parent
 	for _, d in ipairs(tool:GetDescendants()) do
 		if d:IsA("SpotLight") or d:IsA("SurfaceLight") or d:IsA("PointLight") then
 			d.Enabled = false
@@ -13,26 +18,45 @@ local function hideServerLights()
 	end
 end
 
-script.Parent.Activated:Connect(function()
-	if isOn then
-		isOn = false
-		-- VIEWMODEL lights
-		cam["FlashLight viewmodel"].LightPart.Ring.Enabled = false
-	else
-		isOn = true
-		-- VIEWMODEL lights
-		cam["FlashLight viewmodel"].LightPart.Ring.Enabled = true
+local function setViewmodel(enabled: boolean)
+	local vm = cam:FindFirstChild("FlashLight viewmodel")
+	if not vm then return end
+	local lp = vm:FindFirstChild("LightPart")
+	if not lp then return end
+	local ring = lp:FindFirstChild("Ring") or lp:FindFirstChildWhichIsA("Light")
+	if ring and ring:IsA("Light") then
+		ring.Enabled = enabled
+	elseif ring then
+		local l = ring:FindFirstChildWhichIsA("Light")
+		if l then l.Enabled = enabled end
 	end
-	hideServerLights() -- make sure the server/tool beam is off for the owner
-end)
+end
 
--- also hide on equip and every frame while equipped (covers server re-enables)
-script.Parent.Equipped:Connect(function()
+-- Render from authoritative server state only
+local function applyFromAuthoritative()
+	local isOn = tool:GetAttribute("IsOn") == true
+	local hasJuice = Battery.Value > 0
+	setViewmodel(isOn and hasJuice)
+	hideServerLights()
+end
+
+-- CLICK: ask server to toggle; DO NOT pre-enable locally
+tool.Activated:Connect(function()
+	local desired = not (tool:GetAttribute("IsOn") == true)
+	ToggleRequest:FireServer(desired)
+	-- keep world lights hidden; viewmodel will update when server flips IsOn
 	hideServerLights()
 end)
 
+tool.Equipped:Connect(applyFromAuthoritative)
+
 RunService.RenderStepped:Connect(function()
-	if script.Parent.Parent == plr.Character then
+	if tool.Parent == plr.Character then
 		hideServerLights()
 	end
 end)
+
+tool:GetAttributeChangedSignal("IsOn"):Connect(applyFromAuthoritative)
+Battery.Changed:Connect(applyFromAuthoritative)
+
+applyFromAuthoritative()
