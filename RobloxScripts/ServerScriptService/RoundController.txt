@@ -1,0 +1,194 @@
+-- ServerScriptService/RoundController.server.lua
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+
+-- Ensure Remotes exist
+local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
+Remotes.Name = "Remotes"
+Remotes.Parent = RS
+
+local function ensureRemote(name)
+	local r = Remotes:FindFirstChild(name)
+	if not r then r = Instance.new("RemoteEvent"); r.Name = name; r.Parent = Remotes end
+	return r
+end
+
+local RoleRevealEvent = ensureRemote("RoleReveal")
+local RoundStartEvent = ensureRemote("RoundStart")
+local RoundEndEvent   = ensureRemote("RoundEnd")
+
+-- Public API via BindableFunctions
+local RoundAPI      = RS:FindFirstChild("RoundAPI") or Instance.new("Folder")
+RoundAPI.Name       = "RoundAPI"
+RoundAPI.Parent     = RS
+local StartRoundFn  = RoundAPI:FindFirstChild("StartRoundFn") or Instance.new("BindableFunction")
+StartRoundFn.Name   = "StartRoundFn"
+StartRoundFn.Parent = RoundAPI
+local ResetRoundFn  = RoundAPI:FindFirstChild("ResetRoundFn") or Instance.new("BindableFunction")
+ResetRoundFn.Name   = "ResetRoundFn"
+ResetRoundFn.Parent = RoundAPI
+
+-- Modules
+local Modules      = RS:WaitForChild("Modules")
+local RoleService  = require(Modules:WaitForChild("RoleService"))
+local RoundService = require(Modules:WaitForChild("RoundService"))
+
+-- Ensure a default state string exists
+RoundService.State = RoundService.State or "Idle"
+
+-- Timings
+local REVEAL_FLIP = 3.0  -- time to choose
+local REVEAL_HOLD = 3.0  -- time to show result
+
+-- State
+local ROUND_ACTIVE = false
+local SKINWALKER   = nil
+
+local function EndRound(reason)
+	if not ROUND_ACTIVE then return end
+	ROUND_ACTIVE = false
+	RoundService.State = "Ended"
+	RoundEndEvent:FireAllClients(reason or "RoundOver")
+end
+
+local function connectSkinwalkerLifeGuard(sw)
+	if not sw then return end
+	local function hookHumanoid(char)
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum.Died:Connect(function()
+				EndRound("SkinwalkerDied")
+			end)
+		end
+	end
+	if sw.Character then hookHumanoid(sw.Character) end
+	sw.CharacterAdded:Connect(hookHumanoid)
+
+	Players.PlayerRemoving:Connect(function(p)
+		if p == sw then EndRound("SkinwalkerLeft") end
+	end)
+end
+
+local function StartRoundInternal()
+	if ROUND_ACTIVE then
+		warn("StartRound called but a round is already active.")
+		return
+	end
+
+	local lobbyPlayers = Players:GetPlayers()
+	if #lobbyPlayers == 0 then
+		warn("StartRound: no players.")
+		return
+	end
+
+	-- Prep client UIs and freeze controls
+	RoundService.State = "Revealing"
+	RoundStartEvent:FireAllClients({
+		revealFlip = REVEAL_FLIP,
+		revealHold = REVEAL_HOLD
+	})
+
+	-- Assign roles
+	SKINWALKER = RoleService.AssignOneSkinwalker(lobbyPlayers)
+
+	-- Tell each client to flip for REVEAL_FLIP then show result for REVEAL_HOLD
+	for _, p in ipairs(lobbyPlayers) do
+		local role = RoleService.GetRole(p)
+		if role then
+			RoleRevealEvent:FireClient(p, role, REVEAL_HOLD, REVEAL_FLIP)
+		end
+	end
+
+	-- Best effort stats
+	for _, p in ipairs(lobbyPlayers) do
+		local role = RoleService.GetRole(p)
+		if role then
+			RoundService.IncrementRoleCountAsync(p.UserId, role)
+		end
+	end
+
+	-- Round becomes active after reveal completes
+	task.delay(REVEAL_FLIP + REVEAL_HOLD, function()
+		ROUND_ACTIVE = true
+		RoundService.State = "Active"
+		connectSkinwalkerLifeGuard(SKINWALKER)
+	end)
+end
+
+local function ResetRoundInternal()
+	RoleService.ClearAll(Players:GetPlayers())
+	SKINWALKER = nil
+	ROUND_ACTIVE = false
+	RoundService.State = "Idle"
+end
+
+StartRoundFn.OnInvoke = function() StartRoundInternal() end
+ResetRoundFn.OnInvoke = function() ResetRoundInternal() end
+
+_G.StartRound      = StartRoundInternal
+_G.ResetRoundState = ResetRoundInternal
+
+-- ===== Auto-start logic for fresh/reserved servers =====
+-- Works with TeleportData (wait for full party), with solo testing (>=1 player),
+-- and if someone drops during join (fallback start).
+
+local expectedFromTeleportGlobal = nil
+local firstJoinAt = nil
+local pendingAutoStart = false
+
+local function tryStartRound(reason)
+	if pendingAutoStart or ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
+	local current = #Players:GetPlayers()
+	if current >= 1 then
+		pendingAutoStart = true
+		StartRoundInternal()
+		pendingAutoStart = false
+	else
+		warn("tryStartRound called but no players present")
+	end
+end
+
+Players.PlayerAdded:Connect(function(p)
+	if not firstJoinAt then firstJoinAt = os.clock() end
+
+	local joinData = p:GetJoinData()
+	local tp = joinData and joinData.TeleportData
+	if tp and tp.startRound then
+		local got = tonumber(tp.expected) or 1
+		if not expectedFromTeleportGlobal or got > expectedFromTeleportGlobal then
+			expectedFromTeleportGlobal = got
+		end
+	end
+
+	task.delay(0.75, function()
+		if ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
+		local current = #Players:GetPlayers()
+
+		if expectedFromTeleportGlobal then
+			-- Start when all expected have arrived
+			if current >= expectedFromTeleportGlobal then
+				tryStartRound("all arrived")
+				return
+			end
+			-- Fallback after ~5s from first join
+			if firstJoinAt and (os.clock() - firstJoinAt) >= 5 and current >= 1 then
+				tryStartRound("timeout")
+			end
+		else
+			-- No TeleportData: start as soon as >=1 player (good for solo testing)
+			if current >= 1 then
+				tryStartRound("solo/no teleport data")
+			end
+		end
+	end)
+end)
+
+-- If someone leaves before start, start soon after if anyone remains
+Players.PlayerRemoving:Connect(function(p)
+	if ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
+	task.delay(0.5, function()
+		if #Players:GetPlayers() >= 1 then
+			tryStartRound("someone left before start")
+		end
+	end)
+end)

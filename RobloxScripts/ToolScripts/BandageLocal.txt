@@ -1,0 +1,60 @@
+-- LocalScript inside Bandage Tool
+local CAS = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+local tool = script.Parent
+local healReq = tool:WaitForChild("HealRequest")
+
+local equipped = false
+local BIND = "BandageUse"
+
+local function requestHeal()
+	if not equipped then return end
+	-- fire to server; server validates full health, charges, cooldown, etc.
+	healReq:FireServer()
+end
+
+-- High-priority handler so GUI can't swallow the click
+local function onUseAction(actionName, inputState, inputObj)
+	if inputState ~= Enum.UserInputState.Begin then return Enum.ContextActionResult.Pass end
+	requestHeal()
+	return Enum.ContextActionResult.Sink
+end
+
+local function bindInputs()
+	-- Prefer BindActionAtPriority if available (sinks above most UI). Fallback to BindAction.
+	local hasPriority = CAS.BindActionAtPriority ~= nil
+	if hasPriority then
+		CAS:BindActionAtPriority(BIND, onUseAction, false, 2000,
+			Enum.UserInputType.MouseButton1,  -- left click
+			Enum.UserInputType.Touch,         -- mobile tap
+			Enum.KeyCode.E                    -- keyboard backup
+		)
+	else
+		CAS:BindAction(BIND, onUseAction, false,
+			Enum.UserInputType.MouseButton1,
+			Enum.UserInputType.Touch,
+			Enum.KeyCode.E
+		)
+	end
+end
+
+local function unbindInputs()
+	pcall(function() CAS:UnbindAction(BIND) end)
+end
+
+tool.Equipped:Connect(function()
+	equipped = true
+	bindInputs()
+end)
+
+tool.Unequipped:Connect(function()
+	equipped = false
+	unbindInputs()
+end)
+
+-- Keep vanilla Activated too (extra safety if nothing is blocking)
+tool.Activated:Connect(function()
+	requestHeal()
+end)

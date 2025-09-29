@@ -2,9 +2,12 @@
 
 local tool = script.Parent
 
--- Ensure IsOn attribute
+-- Ensure attributes
 if tool:GetAttribute("IsOn") == nil then
 	tool:SetAttribute("IsOn", false)
+end
+if tool:GetAttribute("IsEquipped") == nil then
+	tool:SetAttribute("IsEquipped", false)
 end
 
 -- Ensure Battery NumberValue
@@ -28,22 +31,23 @@ local ring      = lightPart and lightPart:FindFirstChild("Ring")
 local toggleSfx = tool:FindFirstChild("Toggle")  -- optional
 
 -- Tuning
-local DRAIN_PER_SEC    = 1.2
+local DRAIN_PER_SEC    = 0.5
 local AUTO_OFF_AT_ZERO = true
 
 local function applyVisuals()
 	local on       = tool:GetAttribute("IsOn") == true
+	local equipped = tool:GetAttribute("IsEquipped") == true
 	local hasJuice = Battery.Value > 0
+
 	if ring and ring:IsA("Light") then
-		ring.Enabled = on and hasJuice
+		ring.Enabled = on and equipped and hasJuice
 	end
 	if neon and neon:IsA("BasePart") then
-		neon.Transparency = (on and hasJuice) and 0 or 1
+		neon.Transparency = (on and equipped and hasJuice) and 0 or 1
 	end
 end
 
 local function setOn(on: boolean)
-	-- HARD BLOCK: never allow ON when battery is empty
 	if on and Battery.Value <= 0 then
 		on = false
 	end
@@ -62,33 +66,52 @@ local function ownsThisTool(plr)
 	return char and tool.Parent == char
 end
 
--- Client requests a toggle (desired true/false)
+-- Equipped state handling
+local function setEquippedState(isEquipped: boolean)
+	tool:SetAttribute("IsEquipped", isEquipped)
+	applyVisuals()
+	-- Optional safety: if unequipped you can force off to save battery
+	-- setOn(false)
+end
+
+tool.Equipped:Connect(function()
+	setEquippedState(true)
+end)
+
+tool.Unequipped:Connect(function()
+	setEquippedState(false)
+end)
+
+-- Initial equipped detection in case the script starts while already held
+do
+	local parent = tool.Parent
+	local equippedNow = parent and parent:FindFirstChildOfClass("Humanoid") ~= nil
+	tool:SetAttribute("IsEquipped", equippedNow)
+end
+
+-- Client requests a toggle
 ToggleRequest.OnServerEvent:Connect(function(plr, desired)
 	if not ownsThisTool(plr) then return end
-
-	-- Refuse turning ON with empty battery
 	if desired and Battery.Value <= 0 then
 		setOn(false)
 		return
 	end
-
 	setOn(desired == true)
 end)
 
--- Drain loop: server-authoritative so UI (Battery.Changed) updates
+-- Drain loop runs only when equipped and on
 task.spawn(function()
 	while task.wait(0.2) do
-		if tool:GetAttribute("IsOn") and Battery.Value > 0 then
+		if tool:GetAttribute("IsOn") and tool:GetAttribute("IsEquipped") and Battery.Value > 0 then
 			Battery.Value = math.clamp(Battery.Value - (DRAIN_PER_SEC * 0.2), 0, 100)
 			if Battery.Value <= 0 and AUTO_OFF_AT_ZERO then
-				setOn(false) -- enforce OFF immediately at zero
+				setOn(false)
 			end
 			applyVisuals()
 		end
 	end
 end)
 
--- If Battery changes (e.g., recharge), refresh visuals / enforce rule
 Battery.Changed:Connect(function()
 	if Battery.Value <= 0 and tool:GetAttribute("IsOn") then
 		setOn(false)
@@ -97,5 +120,4 @@ Battery.Changed:Connect(function()
 	end
 end)
 
--- Initial correction
 applyVisuals()

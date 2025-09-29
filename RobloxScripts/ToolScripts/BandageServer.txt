@@ -1,0 +1,83 @@
+-- Bandage/ServerScript (no-animation heal + SAFE handoff to FlashLight)
+local RS = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local tool = script.Parent
+
+local healReq    = tool:WaitForChild("HealRequest")
+local chargesVal = tool:WaitForChild("Charges")
+
+local selectEvt  = RS:FindFirstChild("ToolbarSelect") -- optional, for your UI
+local FLASH_NAME = "FlashLight"
+local HEAL_AMOUNT  = 20
+local COOLDOWN_SEC = 1.0
+
+local cooldownUntil = {}
+
+local function humFromTool()
+	local char = tool.Parent
+	return char and char:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function equippedBy(player)
+	return tool.Parent == player.Character
+end
+
+local function handoffToFlashlight(player)
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	-- 1) Force Bandage to unequip so your VM cleanup runs
+	if tool.Parent == char then
+		tool.Parent = player.Backpack           -- triggers Tool.Unequipped
+		task.wait()                             -- yield 1 frame for client cleanup
+	end
+
+	-- 2) Equip FlashLight if present
+	local flash = char:FindFirstChild(FLASH_NAME) or player.Backpack:FindFirstChild(FLASH_NAME)
+	if flash then
+		if flash.Parent == player.Backpack then flash.Parent = char end
+		pcall(function() hum:EquipTool(flash) end)
+	end
+
+	-- 3) Tell your toolbar to select FlashLight (updates icon order)
+	if selectEvt then
+		selectEvt:FireClient(player, FLASH_NAME)
+	end
+
+	-- 4) After a short grace, delete the Bandage (now safely unequipped)
+	task.delay(0.25, function()
+		if tool and tool.Parent then
+			tool:Destroy()
+		end
+	end)
+end
+
+healReq.OnServerEvent:Connect(function(player)
+	if not equippedBy(player) then return end
+
+	local hum = humFromTool()
+	if not hum or hum.Health <= 0 then return end
+	if hum.Health >= hum.MaxHealth then return end
+	if chargesVal.Value <= 0 then return end
+
+	-- cooldown
+	local now = os.clock()
+	local untilTime = cooldownUntil[player.UserId]
+	if untilTime and now < untilTime then return end
+	cooldownUntil[player.UserId] = now + COOLDOWN_SEC
+
+	-- apply heal
+	hum.Health = math.min(hum.MaxHealth, hum.Health + HEAL_AMOUNT)
+
+	-- consume charge and hand off safely
+	chargesVal.Value -= 1
+	if chargesVal.Value <= 0 then
+		handoffToFlashlight(player)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	cooldownUntil[p.UserId] = nil
+end)

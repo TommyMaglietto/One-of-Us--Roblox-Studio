@@ -1,0 +1,94 @@
+-- StarterPlayerScripts/RoleClient.client.lua
+local Players    = game:GetService("Players")
+local RS         = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+local gui    = player:WaitForChild("PlayerGui"):WaitForChild("RoleRevealGui")
+local card   = gui:WaitForChild("Card")
+local rolling= card:WaitForChild("RollingLabel")
+local result = card:WaitForChild("ResultLabel")
+local bottom = card:WaitForChild("BottomHint")
+local sfx    = card:FindFirstChildWhichIsA("Sound")
+
+local Remotes         = RS:WaitForChild("Remotes")
+local RoleRevealEvent = Remotes:WaitForChild("RoleReveal")
+local RoundStartEvent = Remotes:WaitForChild("RoundStart")
+local RoundEndEvent   = Remotes:WaitForChild("RoundEnd")
+
+-- Enable or disable movement while revealing
+local function setControlsEnabled(enabled)
+	local playerModule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+	local controls = playerModule:GetControls()
+	if enabled then controls:Enable() else controls:Disable() end
+
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum  = char:WaitForChild("Humanoid")
+	if enabled then
+		player.CameraMode = Enum.CameraMode.Classic
+		hum.WalkSpeed, hum.JumpPower = 16, 50
+	else
+		player.CameraMode = Enum.CameraMode.LockFirstPerson
+		hum.WalkSpeed, hum.JumpPower = 0, 0
+	end
+end
+
+-- Show or hide the reveal UI. No blackout is used.
+local function showRevealUI(show)
+	gui.Enabled      = show
+	card.Visible     = show
+	rolling.Visible  = show
+	result.Visible   = false
+	card.BackgroundTransparency = 0
+end
+
+local FLIP_WORDS = {"Skinwalker","Human","Human","Skinwalker","Human"}
+
+local function playFlipAnimation(duration)
+	local t, step = 0, 0.08
+	while t < duration do
+		rolling.Text = FLIP_WORDS[(math.floor(t/step) % #FLIP_WORDS) + 1]
+		local dt = RunService.Heartbeat:Wait()
+		t += dt
+	end
+end
+
+-- Round start: prep UI and freeze controls
+RoundStartEvent.OnClientEvent:Connect(function(cfg)
+	setControlsEnabled(false)
+	showRevealUI(true)
+	rolling.Text = "—"
+	result.Visible = false
+	bottom.Text = "Determining your role..."
+end)
+
+-- Server sends your role and timings. Flip then show.
+RoleRevealEvent.OnClientEvent:Connect(function(finalRole, holdSeconds, flipSeconds)
+	playFlipAnimation(flipSeconds or 3.0)
+
+	rolling.Visible = false
+	result.Visible  = true
+	result.Text     = "You are a ...\n" .. tostring(finalRole)
+
+	-- Play SFX only after the role is shown
+	if sfx and sfx.SoundId and sfx.SoundId ~= "" then
+		pcall(function() sfx.TimePosition = 0; sfx:Play() end)
+	end
+
+	task.delay(holdSeconds or 3.0, function()
+		for i = 1, 12 do
+			card.BackgroundTransparency = math.clamp(i/12, 0, 1)
+			RunService.Heartbeat:Wait()
+		end
+		gui.Enabled = false
+		setControlsEnabled(true)
+	end)
+end)
+
+-- Round end: hide card and unlock controls
+RoundEndEvent.OnClientEvent:Connect(function()
+	gui.Enabled = false
+	setControlsEnabled(true)
+end)
+
+player.CharacterAdded:Connect(function() end)
