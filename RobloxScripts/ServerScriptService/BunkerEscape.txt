@@ -1,0 +1,214 @@
+-- ServerScriptService/BunkerEscape.server.lua
+-- Escape prompt parented to Attachment on pivot; once unlocked, no key required.
+
+local Workspace               = game:GetService("Workspace")
+local TeleportService         = game:GetService("TeleportService")
+local ProximityPromptService  = game:GetService("ProximityPromptService")
+
+-- ========= CONFIG =========
+local LOBBY_PLACE_ID       = 84298927326376       -- set to your lobby placeId. 0 = skip teleport
+local KEY_TOOL_NAME        = "Key"
+local REQUIRE_EQUIPPED     = true    -- before unlock: true = must be equipped, false = backpack or equipped
+local MAX_DISTANCE         = 18
+local HOLD_DURATION        = 1.0
+local PROMPT_OFFSET_Y      = 3.0
+
+local AOI_NAME             = "AOI"
+local BUNKER_NAME          = "Bunker"
+local PROMPT_NAME          = "EscapePrompt"
+local ADORNEE_NAME         = "EscapeAdornee"
+local UNLOCK_ATTR          = "EscapeUnlocked"
+
+local LIGHT_GLASS_NAME     = "Glass_LIGHT"
+local GREEN                = Color3.fromRGB(0,255,0)
+local DEBUG                = true
+
+local function log(...) if DEBUG then print("[BunkerEscape]", ...) end end
+local function wlog(...) warn("[BunkerEscape]", ...) end
+
+-- ========= HELPERS =========
+local function waitForPivot(model: Model, timeoutSec: number?): BasePart?
+	timeoutSec = timeoutSec or 5
+	local t0 = os.clock()
+	if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then return model.PrimaryPart end
+	while os.clock() - t0 < timeoutSec do
+		if model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+			return model.PrimaryPart
+		end
+		local pv = model:FindFirstChild("pivot", true) or model:FindFirstChild("Pivot", true)
+		if pv and pv:IsA("BasePart") then return pv end
+		task.wait(0.05)
+	end
+	return nil
+end
+
+local function setUnlockedVisual(bunker: Model)
+	for _, inst in ipairs(bunker:GetDescendants()) do
+		if inst:IsA("PointLight") then
+			inst.Color = GREEN
+		elseif inst:IsA("BasePart") and inst.Name == LIGHT_GLASS_NAME then
+			pcall(function()
+				inst.Color = GREEN
+				if inst:IsA("UnionOperation") then inst.UsePartColor = true end
+				inst.Material = Enum.Material.Neon
+			end)
+		end
+	end
+end
+
+local function hasKeyEquipped(player: Player): boolean
+	local char = player.Character
+	if not char then return false end
+	local held = char:FindFirstChildWhichIsA("Tool")
+	return held ~= nil and held.Name == KEY_TOOL_NAME
+end
+
+local function hasKeyAnywhere(player: Player): boolean
+	if hasKeyEquipped(player) then return true end
+	local bp = player:FindFirstChildOfClass("Backpack")
+	return bp and bp:FindFirstChild(KEY_TOOL_NAME) ~= nil
+end
+
+local function meetsRequirementBeforeUnlock(player: Player): boolean
+	return REQUIRE_EQUIPPED and hasKeyEquipped(player)
+		or (not REQUIRE_EQUIPPED and hasKeyAnywhere(player))
+end
+
+local function teleportToLobby(player: Player)
+	if LOBBY_PLACE_ID == 0 then
+		wlog("Teleport skipped. Set LOBBY_PLACE_ID.")
+		return
+	end
+	local ok, err = pcall(function()
+		TeleportService:Teleport(LOBBY_PLACE_ID, player)
+	end)
+	if not ok then
+		wlog("Teleport failed for", player.Name, err)
+	end
+end
+
+local function setPromptUnlockedText(prompt: ProximityPrompt)
+	-- Make it obvious that no key is required anymore
+	prompt.ObjectText = "Bunker Unlocked"
+	prompt.ActionText = "Escape"
+end
+
+local function setPromptLockedText(prompt: ProximityPrompt)
+	prompt.ObjectText = "Hold E To Escape"
+	prompt.ActionText = "Escape"
+end
+
+-- ========= CORE =========
+local function attachEscapeToBunker(bunker: Model)
+	if bunker:GetAttribute(UNLOCK_ATTR) == nil then
+		bunker:SetAttribute(UNLOCK_ATTR, false)
+	end
+
+	local pivot = waitForPivot(bunker, 5)
+	if not pivot then
+		wlog("No pivot or PrimaryPart for", bunker:GetFullName())
+		return
+	end
+
+	-- ensure one prompt
+	for _, d in ipairs(bunker:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Name == PROMPT_NAME then
+			d:Destroy()
+		end
+	end
+
+	-- attachment host
+	local att: Attachment? = pivot:FindFirstChild(ADORNEE_NAME) :: Attachment
+	if not att then
+		att = Instance.new("Attachment")
+		att.Name = ADORNEE_NAME
+		att.Parent = pivot
+	end
+	att.Position = Vector3.new(0, PROMPT_OFFSET_Y, 0)
+
+	-- create prompt
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = PROMPT_NAME
+	prompt.RequiresLineOfSight = false
+	prompt.MaxActivationDistance = MAX_DISTANCE
+	prompt.HoldDuration = HOLD_DURATION
+	prompt.KeyboardKeyCode = Enum.KeyCode.E
+	prompt.Parent = att
+
+	-- label according to state
+	if bunker:GetAttribute(UNLOCK_ATTR) == true then
+		setPromptUnlockedText(prompt)
+		setUnlockedVisual(bunker)
+	else
+		setPromptLockedText(prompt)
+	end
+
+	-- react if some other script flips the attribute
+	bunker:GetAttributeChangedSignal(UNLOCK_ATTR):Connect(function()
+		if bunker:GetAttribute(UNLOCK_ATTR) == true then
+			setPromptUnlockedText(prompt)
+			setUnlockedVisual(bunker)
+		else
+			setPromptLockedText(prompt)
+		end
+	end)
+
+	-- per player debounce to avoid double teleport
+	local teleporting = {}
+
+	prompt.Triggered:Connect(function(player: Player)
+		if not player or not player.Parent then return end
+
+		local unlocked = bunker:GetAttribute(UNLOCK_ATTR) == true
+
+		if not unlocked then
+			-- still locked, require key
+			if not meetsRequirementBeforeUnlock(player) then
+				local old = prompt.ActionText
+				prompt.ActionText = "Requires Key"
+				task.delay(1.0, function()
+					if prompt and prompt.Parent then prompt.ActionText = old end
+				end)
+				return
+			end
+
+			-- first player unlocks it for everyone
+			bunker:SetAttribute(UNLOCK_ATTR, true)
+			setPromptUnlockedText(prompt)
+			setUnlockedVisual(bunker)
+		end
+
+		-- at this point bunker is unlocked. allow escape without key.
+		if teleporting[player] then return end
+		teleporting[player] = true
+		teleportToLobby(player)
+		task.delay(2, function() teleporting[player] = nil end)
+	end)
+
+	log("Escape prompt attached at", att:GetFullName(), "| pivot =", pivot:GetFullName())
+end
+
+-- ========= BOOTSTRAP =========
+ProximityPromptService.Enabled = true
+log("ProximityPromptService.Enabled =", ProximityPromptService.Enabled)
+
+local function tryAttach(inst: Instance)
+	if inst and inst:IsA("Model") and inst.Name == BUNKER_NAME then
+		task.defer(function()
+			attachEscapeToBunker(inst)
+		end)
+	end
+end
+
+task.defer(function()
+	local aoi = Workspace:FindFirstChild(AOI_NAME)
+	if aoi then
+		for _, d in ipairs(aoi:GetDescendants()) do
+			tryAttach(d)
+		end
+	else
+		wlog("Workspace has no AOI yet. Waiting on DescendantAdded.")
+	end
+end)
+
+Workspace.DescendantAdded:Connect(tryAttach)
