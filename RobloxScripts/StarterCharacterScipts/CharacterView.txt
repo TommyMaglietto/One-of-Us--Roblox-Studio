@@ -1,20 +1,21 @@
--- StarterCharacterScripts/FirstPersonControllerWithRagdollHandoff
+-- StarterCharacterScripts/FirstPersonControllerWithRagdollHandoff (hardened)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
-local camera = workspace.CurrentCamera
+local camera = Workspace.CurrentCamera
 
--- Wait for character & humanoid
+-- wait for character and humanoid
 local character = player.Character or player.CharacterAdded:Wait()
 local humanoid = character:WaitForChild("Humanoid")
 
--- Server creates this; we listen for handoff
+-- server creates this event
 local ragdollEvent = ReplicatedStorage:WaitForChild("RagdollCamEvent")
 
--- ================= SETTINGS =================
+-- settings
 local bobSpeed = .2
 local bobDistance = .2
 local bobWalkMulti = 55
@@ -35,16 +36,16 @@ local turnLeanSmoothing = .9
 local turnLeanMax = .2
 
 local camSmooth = 16
--- ============================================
 
--- Controller state
+-- controller state
 local firstPersonEnabled = true
 local verticalAngle, horizontalAngle, zAngle = 0, 0, 0
 local targetCFrame = CFrame.new()
 local targetRot    = CFrame.Angles(0,0,0)
 
--- Save/restore player camera prefs
+-- originals
 local originals = { mouseBehavior=nil, mouseIcon=nil, camMin=nil, camMax=nil, camMode=nil }
+
 local function saveOriginals()
 	originals.mouseBehavior = UserInputService.MouseBehavior
 	originals.mouseIcon     = UserInputService.MouseIconEnabled
@@ -53,7 +54,7 @@ local function saveOriginals()
 	originals.camMode       = player.CameraMode
 end
 
--- Visibility helpers (do NOT reveal HumanoidRootPart; use LocalTransparencyModifier)
+-- visibility helpers
 local function showForThirdPerson(char)
 	for _, d in ipairs(char:GetDescendants()) do
 		if d:IsA("BasePart") then
@@ -66,7 +67,6 @@ local function showForThirdPerson(char)
 	end
 end
 
--- Enhanced hide to cover accessories and decals reliably
 local function hideForFirstPerson(char)
 	for _, d in ipairs(char:GetDescendants()) do
 		if d:IsA("BasePart") then
@@ -80,15 +80,35 @@ local function hideForFirstPerson(char)
 			end
 		end
 	end
+	-- auto hide anything that spawns later like accessories replicated after join
+	char.DescendantAdded:Connect(function(d)
+		if d:IsA("BasePart") then
+			d.LocalTransparencyModifier = 1
+		elseif d:IsA("Decal") then
+			d.Transparency = 1
+		end
+	end)
 end
 
--- Mouse lock helpers
+-- mouse lock
 local function lockMouse()
 	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
 	UserInputService.MouseIconEnabled = false
 end
 
--- Hard-prepare rig and camera right after spawn/respawn to avoid inside-head frame
+-- adopt new CurrentCamera any time Roblox swaps it
+local function adoptCurrentCamera()
+	camera = Workspace.CurrentCamera
+	if firstPersonEnabled then
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.CameraSubject = nil
+		camera.FieldOfView = targetFOV
+		camera.CFrame = targetCFrame
+	end
+end
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(adoptCurrentCamera)
+
+-- prepare rig and camera
 local function waitRigAndPrime(char: Model)
 	local hum = char:WaitForChild("Humanoid")
 	local hrp = char:WaitForChild("HumanoidRootPart")
@@ -96,34 +116,44 @@ local function waitRigAndPrime(char: Model)
 		char.PrimaryPart = hrp
 	end
 
-	-- Clear any inherited offsets or subjects that can fight script
 	camera.CameraSubject = nil
 	hum.CameraOffset = Vector3.new(0, 0, 0)
 
-	-- Reset angles so we do not reuse old state
 	verticalAngle, horizontalAngle, zAngle = 0, 0, 0
 	targetRot = CFrame.Angles(0, 0, 0)
 
-	-- Build initial FP target and HARD SNAP before any lerp
 	local offset = Vector3.new(0, camOffset, 0)
 	local startPos = hrp.Position + offset
 	targetCFrame = CFrame.new(startPos) * targetRot
 	camera.CFrame = targetCFrame
 end
 
--- Enter FP baseline (once per spawn)
-local function enterFirstPersonOnce()
+-- enter first person
+local function enterFirstPerson()
+	firstPersonEnabled = true
 	camera.CameraType = Enum.CameraType.Scriptable
 	camera.CameraSubject = nil
 	lockMouse()
 	humanoid.AutoRotate = false
+end
+
+-- one time initial
+local function enterFirstPersonOnce()
+	enterFirstPerson()
 	task.defer(lockMouse)
 	RunService.RenderStepped:Wait()
 	lockMouse()
 	UserInputService.WindowFocused:Connect(lockMouse)
+	UserInputService.WindowFocusReleased:Connect(function()
+		-- when alt tabbing, Roblox can flip MouseBehavior
+		if firstPersonEnabled then
+			task.wait() -- let OS focus settle
+			lockMouse()
+		end
+	end)
 end
 
--- Camera math
+-- camera math
 local function UpdateCameraRotation(change)
 	local c = change * sensitivity
 	horizontalAngle += math.rad(c.x)
@@ -132,7 +162,6 @@ local function UpdateCameraRotation(change)
 	targetRot = CFrame.Angles(0, horizontalAngle, 0) * CFrame.Angles(verticalAngle, 0, 0)
 end
 
--- Use HRP world position for stability after server PivotTo
 local function UpdateCameraPosition()
 	if not character then return end
 	local hrp = character:FindFirstChild("HumanoidRootPart")
@@ -169,7 +198,7 @@ local function UpdateFOV(deltaTime)
 	camera.FieldOfView = camera.FieldOfView + (targetFOV - camera.FieldOfView) * deltaTime * FOVsmooth
 end
 
--- Inputs (gated by firstPersonEnabled)
+-- inputs
 UserInputService.InputChanged:Connect(function(input, processed)
 	if not firstPersonEnabled then return end
 	if input.UserInputType == Enum.UserInputType.MouseMovement then
@@ -194,8 +223,20 @@ UserInputService.TouchMoved:Connect(function(touch, processed)
 	UpdateCameraRotation(-Vector3.new(touch.Delta.X, touch.Delta.Y, 0))
 end)
 
-RunService.RenderStepped:Connect(function(deltaTime)
+-- guard and update at camera priority
+local function StepCamera(deltaTime)
 	if firstPersonEnabled then
+		-- guardrails: if anything changed the camera, take it back now
+		if camera ~= Workspace.CurrentCamera then
+			adoptCurrentCamera()
+		end
+		if camera.CameraType ~= Enum.CameraType.Scriptable then
+			camera.CameraType = Enum.CameraType.Scriptable
+		end
+		if camera.CameraSubject ~= nil then
+			camera.CameraSubject = nil
+		end
+
 		local dX, dY = UserInputService:GetMouseDelta()
 		if dX ~= 0 or dY ~= 0 then
 			UpdateCameraRotation(-Vector3.new(dX, dY, 0))
@@ -205,45 +246,45 @@ RunService.RenderStepped:Connect(function(deltaTime)
 		UpdateFOV(deltaTime)
 		camera.CFrame = camera.CFrame:Lerp(targetCFrame, deltaTime * camSmooth)
 
-		-- keep character facing camera Y
+		-- optional face camera yaw without moving position
 		if character and character.PrimaryPart then
 			local _, camY, _ = camera.CFrame:ToOrientation()
-			character:SetPrimaryPartCFrame(CFrame.new(character.PrimaryPart.Position) * CFrame.Angles(0, camY, 0))
+			-- rotate locally by pivot, server will reconcile without big jumps
+			character:PivotTo(CFrame.new(character.PrimaryPart.Position) * CFrame.Angles(0, camY, 0))
 		end
 	end
-end)
+end
 
--- Initial FP
+RunService:BindToRenderStep("FP_Camera", Enum.RenderPriority.Camera.Value, StepCamera)
+
+-- initial first person
 hideForFirstPerson(character)
 waitRigAndPrime(character)
 enterFirstPersonOnce()
 
--- Respawn support
+-- respawn support that never disables the script
 player.CharacterAdded:Connect(function(char)
 	character = char
 	humanoid = char:WaitForChild("Humanoid")
-	camera = workspace.CurrentCamera
+	camera = Workspace.CurrentCamera
 	hideForFirstPerson(character)
 	waitRigAndPrime(character)
-	enterFirstPersonOnce()
+	enterFirstPerson()
 end)
 
--- ============== TEMP THIRD-PERSON HANDOFF ==============
+-- third person ragdoll handoff, then return to FP
 local function enterRagdollThirdPerson(duration)
 	duration = duration or 2
 	firstPersonEnabled = false
 	saveOriginals()
 
-	-- Show body (but HRP stays hidden), unequip tools client-side too
 	showForThirdPerson(character)
 	if humanoid then humanoid:UnequipTools() end
 
-	-- Third-person camera setup
 	player.CameraMode = Enum.CameraMode.Classic
 	player.CameraMinZoomDistance = 8
 	player.CameraMaxZoomDistance = 18
 
-	-- Snap a clear angle first
 	camera.CameraType = Enum.CameraType.Scriptable
 	local hrp = character:FindFirstChild("HumanoidRootPart")
 	if hrp then
@@ -252,39 +293,42 @@ local function enterRagdollThirdPerson(duration)
 		camera.CFrame = CFrame.lookAt(pos, hrp.Position + Vector3.new(0, 3, 0))
 	end
 
-	-- Hand control to Roblox default
 	task.defer(function()
 		camera.CameraType = Enum.CameraType.Custom
 		camera.CameraSubject = humanoid
 	end)
 
-	-- Free mouse while 3P
 	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
 	UserInputService.MouseIconEnabled = true
 
-	-- Restore after duration
 	task.delay(duration, function()
 		if not character or not character.Parent then return end
-
-		-- Hide again for FP
 		hideForFirstPerson(character)
 
-		-- Restore camera prefs
 		player.CameraMinZoomDistance = originals.camMin or 0.5
 		player.CameraMaxZoomDistance = originals.camMax or 128
 		player.CameraMode = originals.camMode or Enum.CameraMode.Classic
 
-		-- Return to our FP control
+		firstPersonEnabled = true
+		camera = Workspace.CurrentCamera
 		camera.CameraType = Enum.CameraType.Scriptable
 		camera.CameraSubject = nil
 		lockMouse()
-		firstPersonEnabled = true
-
-		-- Reprime to avoid one-frame inside-head when returning
 		waitRigAndPrime(character)
 	end)
 end
 
 ragdollEvent.OnClientEvent:Connect(function(duration)
 	enterRagdollThirdPerson(duration)
+end)
+
+-- do not disable the script on death, just stop FP until next character
+humanoid.Died:Connect(function()
+	firstPersonEnabled = false
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	UserInputService.MouseIconEnabled = true
+	-- let CoreScripts drive camera while dead
+	camera = Workspace.CurrentCamera
+	camera.CameraType = Enum.CameraType.Custom
+	camera.CameraSubject = humanoid
 end)
