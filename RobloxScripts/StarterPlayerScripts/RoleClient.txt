@@ -4,19 +4,44 @@ local RS         = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-local gui    = player:WaitForChild("PlayerGui"):WaitForChild("RoleRevealGui")
-local card   = gui:WaitForChild("Card")
-local rolling= card:WaitForChild("RollingLabel")
-local result = card:WaitForChild("ResultLabel")
-local bottom = card:WaitForChild("BottomHint")
-local sfx    = card:FindFirstChildWhichIsA("Sound")
 
-local Remotes         = RS:WaitForChild("Remotes")
-local RoleRevealEvent = Remotes:WaitForChild("RoleReveal")
-local RoundStartEvent = Remotes:WaitForChild("RoundStart")
-local RoundEndEvent   = Remotes:WaitForChild("RoundEnd")
+local Remotes     = RS:WaitForChild("Remotes")
+local RoundPhase  = Remotes:WaitForChild("RoundPhase")
+local ClientReady = Remotes:WaitForChild("ClientReady")
+local ClientAck   = Remotes:WaitForChild("ClientAck")
 
--- Enable or disable movement while revealing
+-- UI (existing)
+local gui      = player:WaitForChild("PlayerGui"):WaitForChild("RoleRevealGui")
+local card     = gui:WaitForChild("Card")
+local rolling  = card:WaitForChild("RollingLabel")   -- used ONLY for flip animation
+local result   = card:WaitForChild("ResultLabel")    -- used ONLY for final role text
+local bottom   = card:WaitForChild("BottomHint")     -- helper hint line
+local sfx      = card:FindFirstChildWhichIsA("Sound")
+
+-- Create a dedicated Waiting label so we never reuse 'result' for Ready text
+local statusLabel = card:FindFirstChild("StatusLabel")
+if not statusLabel then
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "StatusLabel"
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Size = UDim2.new(1, 0, 0, 48)
+	statusLabel.Position = UDim2.new(0, 0, 0.55, 0)
+	statusLabel.Font = Enum.Font.GothamBold
+	statusLabel.TextScaled = true
+	statusLabel.TextColor3 = Color3.new(1,1,1)
+	statusLabel.TextStrokeTransparency = 0.5
+	statusLabel.ZIndex = 20 -- sits above card background, but we’ll toggle visibility anyway
+	statusLabel.Parent = card
+end
+
+-- Ensure phase layers can’t overlap visually
+card.ZIndex = 10
+rolling.ZIndex = 15
+result.ZIndex = 16
+bottom.ZIndex = 17
+statusLabel.ZIndex = 18
+
+-- Controls helper
 local function setControlsEnabled(enabled)
 	local playerModule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
 	local controls = playerModule:GetControls()
@@ -33,18 +58,64 @@ local function setControlsEnabled(enabled)
 	end
 end
 
--- Show or hide the reveal UI. No blackout is used.
-local function showRevealUI(show)
-	gui.Enabled      = show
-	card.Visible     = show
-	rolling.Visible  = show
-	result.Visible   = false
+-- Hard resets so no ghost text persists across frames
+local function hideAll()
+	gui.Enabled = false
+	card.Visible = false
+	rolling.Visible = false
+	result.Visible = false
+	statusLabel.Visible = false
+	rolling.Text = ""
+	result.Text = ""
+	statusLabel.Text = ""
+	bottom.Text = ""
+	card.BackgroundTransparency = 1
+end
+
+local function showWaiting()
+	gui.Enabled = true
+	card.Visible = true
 	card.BackgroundTransparency = 0
+
+	-- Waiting layer ON
+	statusLabel.Visible = true
+	statusLabel.Text = "Waiting For Players"
+
+	-- Reveal layer OFF
+	rolling.Visible = false
+	rolling.Text = ""
+	result.Visible = false
+	result.Text = ""
+
+	bottom.Text = "Preparing..."
+end
+
+local function updateWaiting(payload)
+	if not gui.Enabled or not statusLabel.Visible then
+		showWaiting()
+	end
+	-- Only StatusLabel changes during Waiting
+	statusLabel.Text = string.format("Ready %d / %d", payload.ready or 0, payload.expected or 0)
+	bottom.Text = string.format("Starting in %ds  Present %d", payload.secondsLeft or 0, payload.present or 0)
+end
+
+local function hideWaiting()
+	-- Turn the Waiting layer OFF before we ACK
+	statusLabel.Visible = false
+	statusLabel.Text = ""
+	bottom.Text = ""
+	-- keep card hidden so the next phase draws cleanly on a fresh surface
+	gui.Enabled = false
+	card.Visible = false
 end
 
 local FLIP_WORDS = {"Skinwalker","Human","Human","Skinwalker","Human"}
-
 local function playFlipAnimation(duration)
+	-- Only RollingLabel is active during flip
+	rolling.Visible = true
+	result.Visible  = false
+	statusLabel.Visible = false
+	rolling.Text = "—"
 	local t, step = 0, 0.08
 	while t < duration do
 		rolling.Text = FLIP_WORDS[(math.floor(t/step) % #FLIP_WORDS) + 1]
@@ -53,42 +124,83 @@ local function playFlipAnimation(duration)
 	end
 end
 
--- Round start: prep UI and freeze controls
-RoundStartEvent.OnClientEvent:Connect(function(cfg)
-	setControlsEnabled(false)
-	showRevealUI(true)
-	rolling.Text = "—"
-	result.Visible = false
-	bottom.Text = "Determining your role..."
-end)
+-- Phase handler
+RoundPhase.OnClientEvent:Connect(function(msg)
+	local phase = msg.phase
+	local p     = msg.payload or {}
 
--- Server sends your role and timings. Flip then show.
-RoleRevealEvent.OnClientEvent:Connect(function(finalRole, holdSeconds, flipSeconds)
-	playFlipAnimation(flipSeconds or 3.0)
+	if phase == "Waiting" then
+		setControlsEnabled(false)
+		hideAll()
+		showWaiting()
 
-	rolling.Visible = false
-	result.Visible  = true
-	result.Text     = "You are a ...\n" .. tostring(finalRole)
+	elseif phase == "WaitingUpdate" then
+		updateWaiting(p)
 
-	-- Play SFX only after the role is shown
-	if sfx and sfx.SoundId and sfx.SoundId ~= "" then
-		pcall(function() sfx.TimePosition = 0; sfx:Play() end)
-	end
+	elseif phase == "WaitingEnd" then
+		-- Absolutely hide waiting visuals before acknowledging
+		hideWaiting()
+		task.defer(function()
+			pcall(function() ClientAck:FireServer({phase = "WaitingEnd"}) end)
+		end)
 
-	task.delay(holdSeconds or 3.0, function()
-		for i = 1, 12 do
-			card.BackgroundTransparency = math.clamp(i/12, 0, 1)
-			RunService.Heartbeat:Wait()
+	elseif phase == "RevealBegin" then
+		-- Clean slate: only reveal elements
+		gui.Enabled = true
+		card.Visible = true
+		card.BackgroundTransparency = 0
+
+		-- Waiting OFF
+		statusLabel.Visible = false
+		statusLabel.Text = ""
+
+		-- Reveal prep
+		result.Visible = false
+		result.Text = ""
+		bottom.Text = "Determining your role..."
+		playFlipAnimation(p.flip or 3.0)
+
+	elseif phase == "RevealRole" then
+		-- Only the final role text is shown now
+		rolling.Visible = false
+		rolling.Text = ""
+		statusLabel.Visible = false
+		statusLabel.Text = ""
+
+		result.Visible  = true
+		result.Text     = "You are a ...\n" .. tostring(p.role or "Human")
+
+		if sfx and sfx.SoundId and sfx.SoundId ~= "" then
+			pcall(function() sfx.TimePosition = 0; sfx:Play() end)
 		end
-		gui.Enabled = false
+
+		-- local graceful fade; server will switch to Active after hold
+		task.delay(p.hold or 3.0, function()
+			for i = 1, 12 do
+				card.BackgroundTransparency = math.clamp(i/12, 0, 1)
+				RunService.Heartbeat:Wait()
+			end
+		end)
+
+	elseif phase == "Active" then
+		hideAll()
 		setControlsEnabled(true)
+
+	elseif phase == "RoundEnd" then
+		hideAll()
+		setControlsEnabled(true)
+	end
+end)
+
+-- Tell server we're ready after spawn/UI mount
+local function fireReadyOnce()
+	task.defer(function()
+		local character = player.Character or player.CharacterAdded:Wait()
+		character:WaitForChild("Humanoid")
+		task.wait(0.25)
+		pcall(function() ClientReady:FireServer() end)
 	end)
-end)
+end
 
--- Round end: hide card and unlock controls
-RoundEndEvent.OnClientEvent:Connect(function()
-	gui.Enabled = false
-	setControlsEnabled(true)
-end)
-
-player.CharacterAdded:Connect(function() end)
+if player.Character then fireReadyOnce() end
+player.CharacterAdded:Connect(fireReadyOnce)

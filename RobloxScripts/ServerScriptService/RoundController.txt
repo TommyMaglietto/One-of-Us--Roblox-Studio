@@ -1,23 +1,23 @@
--- ServerScriptService/RoundController.server.lua
 local Players = game:GetService("Players")
 local RS      = game:GetService("ReplicatedStorage")
 
--- Ensure Remotes exist
+-- Remotes
 local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
 Remotes.Name = "Remotes"
 Remotes.Parent = RS
 
-local function ensureRemote(name)
+local function ensureRemote(name, class)
+	class = class or "RemoteEvent"
 	local r = Remotes:FindFirstChild(name)
-	if not r then r = Instance.new("RemoteEvent"); r.Name = name; r.Parent = Remotes end
+	if not r then r = Instance.new(class); r.Name = name; r.Parent = Remotes end
 	return r
 end
 
-local RoleRevealEvent = ensureRemote("RoleReveal")
-local RoundStartEvent = ensureRemote("RoundStart")
-local RoundEndEvent   = ensureRemote("RoundEnd")
+local RoundPhase     = ensureRemote("RoundPhase", "RemoteEvent")   -- server -> clients: {phase=..., payload={...}}
+local ClientReadyEvt = ensureRemote("ClientReady", "RemoteEvent")  -- client -> server (loading done)
+local ClientAckEvt   = ensureRemote("ClientAck", "RemoteEvent")    -- client -> server: {phase="WaitingEnd"} etc.
 
--- Public API via BindableFunctions
+-- Public API
 local RoundAPI      = RS:FindFirstChild("RoundAPI") or Instance.new("Folder")
 RoundAPI.Name       = "RoundAPI"
 RoundAPI.Parent     = RS
@@ -32,127 +32,176 @@ ResetRoundFn.Parent = RoundAPI
 local Modules      = RS:WaitForChild("Modules")
 local RoleService  = require(Modules:WaitForChild("RoleService"))
 local RoundService = require(Modules:WaitForChild("RoundService"))
-
--- Ensure a default state string exists
 RoundService.State = RoundService.State or "Idle"
 
--- Timings
-local REVEAL_FLIP = 3.0  -- time to choose
-local REVEAL_HOLD = 3.0  -- time to show result
+-- Tunables
+local WAIT_SECONDS  = 15
+local REVEAL_FLIP   = 3.0
+local REVEAL_HOLD   = 3.0
 
 -- State
-local ROUND_ACTIVE = false
-local SKINWALKER   = nil
+local ROUND_ACTIVE  = false
+local SKINWALKER    = nil
+local expectedFromTeleportGlobal = nil
+local firstJoinAt   = nil
+local waitingTickerRunning = false
+local waitingStopped = false
+local readySet      = {}          -- userId -> true
+local waitingAcks   = {}          -- userId -> true (acked WaitingEnd)
+local sawReveal     = {}          -- userId -> true
+
+local function SafeSetRole(p, role)
+	if RoleService.SetRole then pcall(function() RoleService.SetRole(p, role) end) end
+end
+
+local function presentPlayers()
+	return Players:GetPlayers()
+end
+
+local function broadcastPhase(phase, payload)
+	RoundPhase:FireAllClients({phase = phase, payload = payload or {}})
+end
 
 local function EndRound(reason)
-	if not ROUND_ACTIVE then return end
+	if not ROUND_ACTIVE and RoundService.State ~= "Revealing" and RoundService.State ~= "Waiting" then return end
 	ROUND_ACTIVE = false
+	SKINWALKER = nil
+	readySet = {}
+	waitingAcks = {}
+	sawReveal = {}
+	waitingStopped = true
 	RoundService.State = "Ended"
-	RoundEndEvent:FireAllClients(reason or "RoundOver")
+	broadcastPhase("RoundEnd", {reason = reason or "RoundOver"})
 end
 
-local function connectSkinwalkerLifeGuard(sw)
-	if not sw then return end
-	local function hookHumanoid(char)
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if hum then
-			hum.Died:Connect(function()
-				EndRound("SkinwalkerDied")
-			end)
+-- =============== WAITING ===============
+local function runWaitingLoop()
+	if waitingTickerRunning then return end
+	waitingTickerRunning = true
+	waitingStopped = false
+	RoundService.State = "Waiting"
+
+	local startClock = os.clock()
+	local expected = expectedFromTeleportGlobal or math.max(1, #presentPlayers())
+
+	-- Tell everyone to show Waiting UI
+	broadcastPhase("Waiting", {seconds = WAIT_SECONDS, expected = expected})
+
+	while not waitingStopped do
+		local now = os.clock()
+		local left = math.max(0, WAIT_SECONDS - math.floor(now - startClock))
+		local present = presentPlayers()
+		local readyCount = 0
+		for _, plr in ipairs(present) do
+			if readySet[plr.UserId] then readyCount += 1 end
 		end
-	end
-	if sw.Character then hookHumanoid(sw.Character) end
-	sw.CharacterAdded:Connect(hookHumanoid)
 
-	Players.PlayerRemoving:Connect(function(p)
-		if p == sw then EndRound("SkinwalkerLeft") end
-	end)
+		-- Per-second update
+		broadcastPhase("WaitingUpdate", {
+			expected   = expected,
+			present    = #present,
+			ready      = readyCount,
+			secondsLeft= left,
+		})
+
+		-- Exit criteria: all expected ready OR timeout with at least 1 present
+		if (#present >= 1) and (readyCount >= expected or left <= 0) then
+			break
+		end
+		task.wait(1)
+	end
+
+	waitingTickerRunning = false
 end
 
-local function StartRoundInternal()
-	if ROUND_ACTIVE then
-		warn("StartRound called but a round is already active.")
+-- =============== REVEAL (serialized with ACK) ===============
+local function startRevealSerialized()
+	-- Stop waiting immediately so countdown cannot continue sending
+	waitingStopped = true
+
+	-- Phase 1: tell clients to hide waiting UI; await ACKs
+	RoundService.State = "Transition"
+	waitingAcks = {}
+	broadcastPhase("WaitingEnd", {})  -- clients hide waiting UI and ack
+
+	-- Wait for acks or brief timeout
+	local deadline = os.clock() + 1.0
+	repeat
+		local allAck = true
+		for _, plr in ipairs(presentPlayers()) do
+			if not waitingAcks[plr.UserId] then allAck = false break end
+		end
+		if allAck then break end
+		task.wait(0.05)
+	until os.clock() >= deadline
+
+	-- Phase 2: compute roles
+	local lobby = presentPlayers()
+	if #lobby == 0 then
+		RoundService.State = "Idle"
 		return
 	end
 
-	local lobbyPlayers = Players:GetPlayers()
-	if #lobbyPlayers == 0 then
-		warn("StartRound: no players.")
-		return
+	-- ready vs not ready -> force unready Human
+	local readyList, notReadyList = {}, {}
+	for _, p in ipairs(lobby) do
+		if readySet[p.UserId] then table.insert(readyList, p) else table.insert(notReadyList, p) end
+	end
+	local candidates = (#readyList > 0) and readyList or lobby
+	SKINWALKER = RoleService.AssignOneSkinwalker(candidates)
+	for _, p in ipairs(notReadyList) do
+		if p ~= SKINWALKER then SafeSetRole(p, "Human") end
 	end
 
-	-- Prep client UIs and freeze controls
+	-- Phase 3: begin reveal spin
 	RoundService.State = "Revealing"
-	RoundStartEvent:FireAllClients({
-		revealFlip = REVEAL_FLIP,
-		revealHold = REVEAL_HOLD
-	})
+	broadcastPhase("RevealBegin", {flip = REVEAL_FLIP, hold = REVEAL_HOLD})
 
-	-- Assign roles
-	SKINWALKER = RoleService.AssignOneSkinwalker(lobbyPlayers)
-
-	-- Tell each client to flip for REVEAL_FLIP then show result for REVEAL_HOLD
-	for _, p in ipairs(lobbyPlayers) do
-		local role = RoleService.GetRole(p)
-		if role then
-			RoleRevealEvent:FireClient(p, role, REVEAL_HOLD, REVEAL_FLIP)
+	-- Phase 4: push final roles
+	task.delay(REVEAL_FLIP, function()
+		for _, p in ipairs(presentPlayers()) do
+			if not sawReveal[p.UserId] then
+				sawReveal[p.UserId] = true
+				local role = RoleService.GetRole(p) or ((p == SKINWALKER) and "Skinwalker" or "Human")
+				RoundPhase:FireClient(p, {phase = "RevealRole", payload = {role = role, hold = REVEAL_HOLD}})
+			end
 		end
-	end
 
-	-- Best effort stats
-	for _, p in ipairs(lobbyPlayers) do
-		local role = RoleService.GetRole(p)
-		if role then
-			RoundService.IncrementRoleCountAsync(p.UserId, role)
-		end
-	end
-
-	-- Round becomes active after reveal completes
-	task.delay(REVEAL_FLIP + REVEAL_HOLD, function()
-		ROUND_ACTIVE = true
-		RoundService.State = "Active"
-		connectSkinwalkerLifeGuard(SKINWALKER)
+		-- Phase 5: active after hold
+		task.delay(REVEAL_HOLD, function()
+			RoundService.State = "Active"
+			ROUND_ACTIVE = true
+			broadcastPhase("Active", {})
+		end)
 	end)
+end
+
+-- API entry
+local function StartRoundInternal()
+	if ROUND_ACTIVE then return end
+	startRevealSerialized()
 end
 
 local function ResetRoundInternal()
 	RoleService.ClearAll(Players:GetPlayers())
 	SKINWALKER = nil
 	ROUND_ACTIVE = false
+	readySet = {}
+	waitingAcks = {}
+	sawReveal = {}
+	waitingStopped = true
 	RoundService.State = "Idle"
 end
 
 StartRoundFn.OnInvoke = function() StartRoundInternal() end
 ResetRoundFn.OnInvoke = function() ResetRoundInternal() end
 
-_G.StartRound      = StartRoundInternal
-_G.ResetRoundState = ResetRoundInternal
-
--- ===== Auto-start logic for fresh/reserved servers =====
--- Works with TeleportData (wait for full party), with solo testing (>=1 player),
--- and if someone drops during join (fallback start).
-
-local expectedFromTeleportGlobal = nil
-local firstJoinAt = nil
-local pendingAutoStart = false
-
-local function tryStartRound(reason)
-	if pendingAutoStart or ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
-	local current = #Players:GetPlayers()
-	if current >= 1 then
-		pendingAutoStart = true
-		StartRoundInternal()
-		pendingAutoStart = false
-	else
-		warn("tryStartRound called but no players present")
-	end
-end
-
+-- =============== JOIN / SIGNALS ===============
 Players.PlayerAdded:Connect(function(p)
 	if not firstJoinAt then firstJoinAt = os.clock() end
 
-	local joinData = p:GetJoinData()
-	local tp = joinData and joinData.TeleportData
+	local jd = p:GetJoinData()
+	local tp = jd and jd.TeleportData
 	if tp and tp.startRound then
 		local got = tonumber(tp.expected) or 1
 		if not expectedFromTeleportGlobal or got > expectedFromTeleportGlobal then
@@ -160,35 +209,58 @@ Players.PlayerAdded:Connect(function(p)
 		end
 	end
 
-	task.delay(0.75, function()
-		if ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
-		local current = #Players:GetPlayers()
+	-- If we’re idle or waiting, run waiting loop (idempotent)
+	if RoundService.State == "Idle" or RoundService.State == "Waiting" then
+		runWaitingLoop()
+	end
 
-		if expectedFromTeleportGlobal then
-			-- Start when all expected have arrived
-			if current >= expectedFromTeleportGlobal then
-				tryStartRound("all arrived")
-				return
-			end
-			-- Fallback after ~5s from first join
-			if firstJoinAt and (os.clock() - firstJoinAt) >= 5 and current >= 1 then
-				tryStartRound("timeout")
-			end
-		else
-			-- No TeleportData: start as soon as >=1 player (good for solo testing)
-			if current >= 1 then
-				tryStartRound("solo/no teleport data")
-			end
-		end
-	end)
+	-- If reveal/active already started, late joiners become Human with a short reveal end
+	if RoundService.State == "Revealing" or ROUND_ACTIVE then
+		SafeSetRole(p, "Human")
+		task.defer(function()
+			RoundPhase:FireClient(p, {phase = "RevealBegin", payload = {flip = 0.4, hold = 0.8}})
+			task.delay(0.4, function()
+				RoundPhase:FireClient(p, {phase = "RevealRole", payload = {role = "Human", hold = 0.8}})
+			end)
+		end)
+	end
 end)
 
--- If someone leaves before start, start soon after if anyone remains
 Players.PlayerRemoving:Connect(function(p)
-	if ROUND_ACTIVE or RoundService.State ~= "Idle" then return end
-	task.delay(0.5, function()
-		if #Players:GetPlayers() >= 1 then
-			tryStartRound("someone left before start")
+	readySet[p.UserId] = nil
+	waitingAcks[p.UserId] = nil
+end)
+
+ClientReadyEvt.OnServerEvent:Connect(function(player)
+	readySet[player.UserId] = true
+
+	if RoundService.State == "Waiting" then
+		local expected = expectedFromTeleportGlobal or #presentPlayers()
+		local readyCount = 0
+		for _, plr in ipairs(presentPlayers()) do if readySet[plr.UserId] then readyCount += 1 end end
+		if readyCount >= math.max(1, expected) then
+			startRevealSerialized()
 		end
-	end)
+	end
+end)
+
+ClientAckEvt.OnServerEvent:Connect(function(player, data)
+	data = data or {}
+	if data.phase == "WaitingEnd" then
+		waitingAcks[player.UserId] = true
+	end
+end)
+
+-- Supervisor to start after 15s if not all ready, but at least one present
+task.spawn(function()
+	while true do
+		if RoundService.State == "Waiting" and firstJoinAt and not waitingStopped then
+			if #presentPlayers() >= 1 and (os.clock() - firstJoinAt) >= WAIT_SECONDS then
+				startRevealSerialized()
+			end
+		elseif RoundService.State == "Idle" and #presentPlayers() >= 1 then
+			runWaitingLoop()
+		end
+		task.wait(0.25)
+	end
 end)
