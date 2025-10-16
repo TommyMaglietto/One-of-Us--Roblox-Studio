@@ -1,0 +1,135 @@
+print("[RoundProgression] BOOTSTRAP: file executing") -- must appear on server output
+
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+
+local Defs    = require(RS.Shared.ProgressionDefs)   -- if this fails, you'll see the BOOTSTRAP but not "ready"
+local Net     = require(RS.Shared.Network)
+
+local Remotes = Net.Remotes()
+local Sig     = Net.Signals()
+
+local LOG = true
+local function log(...) if LOG then print("[RoundProgression]", ...) end end
+local function warnlog(...) warn("[RoundProgression]", ...) end
+
+local snapshot = Defs.newSnapshot()
+
+local function snapStr(s)
+	return string.format(
+		"{stage=%s gen=%d/%d bridge=%d/%d power=%s key=%s bunker=%s}",
+		s.stage, s.generatorsFixed, s.generatorsRequired,
+		s.bridgeSlotsFilled, s.bridgeSlotsRequired,
+		s.powerOn and "on" or "off",
+		s.hasKey and "yes" or "no",
+		s.bunkerUnlocked and "open" or "locked"
+	)
+end
+
+local function pushSnapshot(toPlayer, reason)
+	snapshot.updatedAt = os.clock()
+	if toPlayer then
+		log("pushSnapshot ->", toPlayer.Name, "reason=", reason or "?", snapStr(snapshot))
+		Remotes.ProgressionSnapshot:FireClient(toPlayer, snapshot)
+	else
+		log("pushSnapshot -> ALL", "reason=", reason or "?", snapStr(snapshot))
+		Remotes.ProgressionSnapshot:FireAllClients(snapshot)
+	end
+end
+
+local function setStage(newStage, why)
+	if snapshot.stage == newStage then return end
+	log("STAGE", snapshot.stage, "->", newStage, "why=", why or "?")
+	snapshot.stage = newStage
+	pushSnapshot(nil, "stage:"..newStage)
+end
+
+local function tryAdvanceFromGenerators()
+	if snapshot.stage == Defs.Stage.AwaitingGenerators
+		and snapshot.generatorsFixed >= snapshot.generatorsRequired then
+		setStage(Defs.Stage.GeneratorsFixed, "generators complete")
+	end
+end
+local function tryAdvanceFromBridge()
+	if snapshot.stage == Defs.Stage.GeneratorsFixed
+		and snapshot.bridgeSlotsFilled >= snapshot.bridgeSlotsRequired then
+		setStage(Defs.Stage.BridgeBuilt, "bridge complete")
+	end
+end
+local function tryAdvanceFromPower()
+	if snapshot.stage == Defs.Stage.BridgeBuilt and snapshot.powerOn then
+		setStage(Defs.Stage.PowerOn, "power on")
+	end
+end
+local function tryAdvanceFromBunker()
+	if snapshot.stage == Defs.Stage.PowerOn and snapshot.bunkerUnlocked then
+		setStage(Defs.Stage.BunkerUnlocked, "bunker open")
+	end
+end
+
+-- Signals
+Sig.GeneratorFixed.Event:Connect(function(id)
+	log("Evt: GeneratorFixed id=", id or "(nil)")
+	snapshot.generatorsFixed = math.clamp(snapshot.generatorsFixed + 1, 0, snapshot.generatorsRequired)
+	pushSnapshot(nil, "genFixed")
+	tryAdvanceFromGenerators()
+end)
+Sig.PlankPlaced.Event:Connect(function(slotId)
+	log("Evt: PlankPlaced slot=", slotId or "(nil)")
+	snapshot.bridgeSlotsFilled = math.clamp(snapshot.bridgeSlotsFilled + 1, 0, snapshot.bridgeSlotsRequired)
+	pushSnapshot(nil, "plankPlaced")
+	tryAdvanceFromBridge()
+end)
+Sig.AllBridgePlanksPlaced.Event:Connect(function()
+	log("Evt: AllBridgePlanksPlaced")
+	snapshot.bridgeSlotsFilled = snapshot.bridgeSlotsRequired
+	pushSnapshot(nil, "bridgeComplete")
+	tryAdvanceFromBridge()
+end)
+Sig.ElectricalBoxRepaired.Event:Connect(function()
+	log("Evt: ElectricalBoxRepaired")
+	if not snapshot.powerOn then
+		snapshot.powerOn = true
+		pushSnapshot(nil, "powerOn")
+		tryAdvanceFromPower()
+	end
+end)
+Sig.KeyPickedUp.Event:Connect(function()
+	log("Evt: KeyPickedUp")
+	if not snapshot.hasKey then
+		snapshot.hasKey = true
+		pushSnapshot(nil, "keyPicked")
+	end
+end)
+Sig.BunkerUnlocked.Event:Connect(function()
+	log("Evt: BunkerUnlocked")
+	if not snapshot.bunkerUnlocked then
+		snapshot.bunkerUnlocked = true
+		pushSnapshot(nil, "bunkerUnlocked")
+		tryAdvanceFromBunker()
+	end
+end)
+Sig.PlayerEscaped.Event:Connect(function(player)
+	log("Evt: PlayerEscaped", player and player.Name or "(nil)")
+	if snapshot.stage == Defs.Stage.BunkerUnlocked then
+		setStage(Defs.Stage.Escaped, "player escaped")
+	end
+end))
+
+Players.PlayerAdded:Connect(function(plr)
+	log("PlayerAdded -> initial snapshot", plr.Name)
+	pushSnapshot(plr, "lateJoin")
+end)
+
+-- RFNs
+local Rem = Remotes
+Rem.ProgressionPing.OnServerInvoke = function(plr)
+	log("RFN: ProgressionPing from", plr and plr.Name or "(nil)")
+	return true
+end
+Rem.ProgressionGetSnapshot.OnServerInvoke = function(plr)
+	log("RFN: ProgressionGetSnapshot from", plr and plr.Name or "(nil)", "->", snapStr(snapshot))
+	return snapshot
+end
+
+log("RoundProgression ready.", snapStr(snapshot))

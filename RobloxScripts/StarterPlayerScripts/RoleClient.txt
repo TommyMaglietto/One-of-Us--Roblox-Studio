@@ -1,7 +1,8 @@
 -- StarterPlayerScripts/RoleClient.client.lua
-local Players    = game:GetService("Players")
-local RS         = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+local Players      = game:GetService("Players")
+local RS           = game:GetService("ReplicatedStorage")
+local RunService   = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 
@@ -13,12 +14,12 @@ local ClientAck   = Remotes:WaitForChild("ClientAck")
 -- UI (existing)
 local gui      = player:WaitForChild("PlayerGui"):WaitForChild("RoleRevealGui")
 local card     = gui:WaitForChild("Card")
-local rolling  = card:WaitForChild("RollingLabel")   -- used ONLY for flip animation
-local result   = card:WaitForChild("ResultLabel")    -- used ONLY for final role text
-local bottom   = card:WaitForChild("BottomHint")     -- helper hint line
+local rolling  = card:WaitForChild("RollingLabel")   -- flip animation only
+local result   = card:WaitForChild("ResultLabel")    -- final role only
+local bottom   = card:WaitForChild("BottomHint")
 local sfx      = card:FindFirstChildWhichIsA("Sound")
 
--- Create a dedicated Waiting label so we never reuse 'result' for Ready text
+-- Dedicated Waiting label so we never reuse 'result' for Ready text
 local statusLabel = card:FindFirstChild("StatusLabel")
 if not statusLabel then
 	statusLabel = Instance.new("TextLabel")
@@ -30,11 +31,13 @@ if not statusLabel then
 	statusLabel.TextScaled = true
 	statusLabel.TextColor3 = Color3.new(1,1,1)
 	statusLabel.TextStrokeTransparency = 0.5
-	statusLabel.ZIndex = 20 -- sits above card background, but we’ll toggle visibility anyway
+	statusLabel.ZIndex = 20
+	statusLabel.Text = ""
+	statusLabel.Visible = false
 	statusLabel.Parent = card
 end
 
--- Ensure phase layers can’t overlap visually
+-- Layer order
 card.ZIndex = 10
 rolling.ZIndex = 15
 result.ZIndex = 16
@@ -58,7 +61,7 @@ local function setControlsEnabled(enabled)
 	end
 end
 
--- Hard resets so no ghost text persists across frames
+-- Hard reset
 local function hideAll()
 	gui.Enabled = false
 	card.Visible = false
@@ -69,7 +72,7 @@ local function hideAll()
 	result.Text = ""
 	statusLabel.Text = ""
 	bottom.Text = ""
-	card.BackgroundTransparency = 1
+	card.BackgroundTransparency = 0 -- keep solid when visible
 end
 
 local function showWaiting()
@@ -77,11 +80,9 @@ local function showWaiting()
 	card.Visible = true
 	card.BackgroundTransparency = 0
 
-	-- Waiting layer ON
 	statusLabel.Visible = true
 	statusLabel.Text = "Waiting For Players"
 
-	-- Reveal layer OFF
 	rolling.Visible = false
 	rolling.Text = ""
 	result.Visible = false
@@ -94,33 +95,128 @@ local function updateWaiting(payload)
 	if not gui.Enabled or not statusLabel.Visible then
 		showWaiting()
 	end
-	-- Only StatusLabel changes during Waiting
 	statusLabel.Text = string.format("Ready %d / %d", payload.ready or 0, payload.expected or 0)
 	bottom.Text = string.format("Starting in %ds  Present %d", payload.secondsLeft or 0, payload.present or 0)
 end
 
 local function hideWaiting()
-	-- Turn the Waiting layer OFF before we ACK
 	statusLabel.Visible = false
 	statusLabel.Text = ""
 	bottom.Text = ""
-	-- keep card hidden so the next phase draws cleanly on a fresh surface
 	gui.Enabled = false
 	card.Visible = false
 end
 
+-- Collect all GUI objects we can fade
+local function collectFadeTargets(root)
+	local list = {}
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("GuiObject") then
+			table.insert(list, d)
+		end
+	end
+	return list
+end
+
+-- Fade the entire GUI (text, images, backgrounds, strokes) then hide & restore originals
+local function fadeOutGuiThenHide(root, duration)
+	duration = duration or 0.6
+	local tweens = {}
+	local originals = {}
+
+	local function addTween(inst, prop, toValue)
+		local fromValue = inst[prop]
+		originals[#originals+1] = {inst = inst, prop = prop, value = fromValue}
+		local tween = TweenService:Create(inst, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {[prop] = toValue})
+		table.insert(tweens, tween)
+		return tween
+	end
+
+	for _, g in ipairs(collectFadeTargets(root)) do
+		-- Background
+		if g:IsA("Frame") or g:IsA("TextLabel") or g:IsA("TextButton") or g:IsA("ImageLabel") or g:IsA("ImageButton") or g:IsA("ScrollingFrame") then
+			if g.BackgroundTransparency < 1 then
+				addTween(g, "BackgroundTransparency", 1)
+			end
+		end
+		-- Images
+		if (g:IsA("ImageLabel") or g:IsA("ImageButton")) and g.Image ~= "" then
+			if g.ImageTransparency < 1 then
+				addTween(g, "ImageTransparency", 1)
+			end
+		end
+		-- Text
+		if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text ~= "" then
+			if g.TextTransparency < 1 then
+				addTween(g, "TextTransparency", 1)
+			end
+			if g.TextStrokeTransparency < 1 then
+				addTween(g, "TextStrokeTransparency", 1)
+			end
+		end
+		-- UIStroke (if present)
+		local stroke = g:FindFirstChildOfClass("UIStroke")
+		if stroke and stroke.Transparency < 1 then
+			addTween(stroke, "Transparency", 1)
+		end
+	end
+
+	for _, t in ipairs(tweens) do t:Play() end
+	local elapsed = 0
+	while elapsed < duration do
+		local dt = RunService.Heartbeat:Wait()
+		elapsed += dt
+	end
+
+	-- Hide and restore originals so next round starts pristine
+	gui.Enabled = false
+	card.Visible = false
+	for _, rec in ipairs(originals) do
+		if rec.inst and rec.inst.Parent then
+			rec.inst[rec.prop] = rec.value
+		end
+	end
+end
+
+-- ==============================
+-- Exponential ease-out flip: fast -> slow until reveal
+-- ==============================
 local FLIP_WORDS = {"Skinwalker","Human","Human","Skinwalker","Human"}
 local function playFlipAnimation(duration)
-	-- Only RollingLabel is active during flip
+	-- Tweakables
+	local MIN_STEP = 0.03   -- fastest swap interval at the start
+	local MAX_STEP = 0.22   -- slowest near the end
+
+	-- Setup
 	rolling.Visible = true
 	result.Visible  = false
 	statusLabel.Visible = false
 	rolling.Text = "—"
-	local t, step = 0, 0.08
-	while t < duration do
-		rolling.Text = FLIP_WORDS[(math.floor(t/step) % #FLIP_WORDS) + 1]
-		local dt = RunService.Heartbeat:Wait()
-		t += dt
+
+	local start = os.clock()
+	local lastSwap = start
+	local idx = 1
+
+	local function easeOutExpo(p)
+		if p >= 1 then return 1 end
+		return 1 - 2^(-10 * p)
+	end
+
+	while true do
+		local t = os.clock() - start
+		if t >= duration then break end
+
+		local p = math.clamp(t / duration, 0, 1)
+		local eased = easeOutExpo(p)
+		local step = MIN_STEP + (MAX_STEP - MIN_STEP) * eased
+
+		if os.clock() - lastSwap >= step then
+			idx = (idx % #FLIP_WORDS) + 1
+			rolling.Text = FLIP_WORDS[idx]
+			lastSwap = os.clock()
+		end
+
+		RunService.Heartbeat:Wait()
 	end
 end
 
@@ -138,30 +234,27 @@ RoundPhase.OnClientEvent:Connect(function(msg)
 		updateWaiting(p)
 
 	elseif phase == "WaitingEnd" then
-		-- Absolutely hide waiting visuals before acknowledging
+		-- Kill waiting visuals before acknowledging
 		hideWaiting()
 		task.defer(function()
 			pcall(function() ClientAck:FireServer({phase = "WaitingEnd"}) end)
 		end)
 
 	elseif phase == "RevealBegin" then
-		-- Clean slate: only reveal elements
+		-- Clean slate for reveal
 		gui.Enabled = true
 		card.Visible = true
 		card.BackgroundTransparency = 0
 
-		-- Waiting OFF
 		statusLabel.Visible = false
 		statusLabel.Text = ""
 
-		-- Reveal prep
 		result.Visible = false
 		result.Text = ""
 		bottom.Text = "Determining your role..."
 		playFlipAnimation(p.flip or 3.0)
 
 	elseif phase == "RevealRole" then
-		-- Only the final role text is shown now
 		rolling.Visible = false
 		rolling.Text = ""
 		statusLabel.Visible = false
@@ -173,21 +266,16 @@ RoundPhase.OnClientEvent:Connect(function(msg)
 		if sfx and sfx.SoundId and sfx.SoundId ~= "" then
 			pcall(function() sfx.TimePosition = 0; sfx:Play() end)
 		end
-
-		-- local graceful fade; server will switch to Active after hold
-		task.delay(p.hold or 3.0, function()
-			for i = 1, 12 do
-				card.BackgroundTransparency = math.clamp(i/12, 0, 1)
-				RunService.Heartbeat:Wait()
-			end
-		end)
+		-- No fade here; we fade the whole GUI only when gameplay starts (Active)
 
 	elseif phase == "Active" then
-		hideAll()
+		-- Fade the entire GUI, then hide & unlock
+		fadeOutGuiThenHide(gui, 0.6)
 		setControlsEnabled(true)
 
 	elseif phase == "RoundEnd" then
-		hideAll()
+		-- If the round is force-ended during reveal/waiting, fade out as well
+		fadeOutGuiThenHide(gui, 0.4)
 		setControlsEnabled(true)
 	end
 end)
