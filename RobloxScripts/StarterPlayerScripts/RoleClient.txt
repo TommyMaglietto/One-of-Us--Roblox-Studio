@@ -1,25 +1,43 @@
 -- StarterPlayerScripts/RoleClient.client.lua
+-- Uses prebuilt StarterGui "StudioBootGui". Forces boot above everything, disables controls until Active.
+-- Plays a shared roll then reads a single shared RevealRoles payload so everyone flips together.
+-- Now includes reveal_uid de-dup so RevealBegin and RevealRoles only apply once per round.
+
 local Players      = game:GetService("Players")
 local RS           = game:GetService("ReplicatedStorage")
 local RunService   = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
+local function clog(fmt, ...) print(string.format("[RoleClient %s] "..fmt, player.Name, ...)) end
 
 local Remotes     = RS:WaitForChild("Remotes")
 local RoundPhase  = Remotes:WaitForChild("RoundPhase")
 local ClientReady = Remotes:WaitForChild("ClientReady")
 local ClientAck   = Remotes:WaitForChild("ClientAck")
 
--- UI (existing)
-local gui      = player:WaitForChild("PlayerGui"):WaitForChild("RoleRevealGui")
-local card     = gui:WaitForChild("Card")
-local rolling  = card:WaitForChild("RollingLabel")   -- flip animation only
-local result   = card:WaitForChild("ResultLabel")    -- final role only
-local bottom   = card:WaitForChild("BottomHint")
-local sfx      = card:FindFirstChildWhichIsA("Sound")
+local pg = player:WaitForChild("PlayerGui")
 
--- Dedicated Waiting label so we never reuse 'result' for Ready text
+-- Boot GUI
+local bootGui = pg:WaitForChild("StudioBootGui")
+bootGui.DisplayOrder = 10000
+bootGui.Enabled = true
+local bootRoot = bootGui:WaitForChild("Root")
+local bootWaitText = bootRoot:WaitForChild("WaitText")
+local bootSub = bootRoot:WaitForChild("SubText")
+bootWaitText.Text = "Waiting for players."
+bootSub.Text = "Ready 0 / 0   Present 0   Starting soon"
+
+-- Role reveal GUI you already have
+local roleGui   = pg:WaitForChild("RoleRevealGui")
+roleGui.DisplayOrder = 5000
+roleGui.Enabled = false
+local card      = roleGui:WaitForChild("Card")
+local rolling   = card:WaitForChild("RollingLabel")
+local result    = card:WaitForChild("ResultLabel")
+local bottom    = card:WaitForChild("BottomHint")
+local sfx       = card:FindFirstChildWhichIsA("Sound")
+
 local statusLabel = card:FindFirstChild("StatusLabel")
 if not statusLabel then
 	statusLabel = Instance.new("TextLabel")
@@ -37,14 +55,7 @@ if not statusLabel then
 	statusLabel.Parent = card
 end
 
--- Layer order
-card.ZIndex = 10
-rolling.ZIndex = 15
-result.ZIndex = 16
-bottom.ZIndex = 17
-statusLabel.ZIndex = 18
-
--- Controls helper
+-- Controls: lock walking and jumping during Waiting and Reveal
 local function setControlsEnabled(enabled)
 	local playerModule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
 	local controls = playerModule:GetControls()
@@ -61,162 +72,174 @@ local function setControlsEnabled(enabled)
 	end
 end
 
--- Hard reset
-local function hideAll()
-	gui.Enabled = false
-	card.Visible = false
-	rolling.Visible = false
-	result.Visible = false
-	statusLabel.Visible = false
-	rolling.Text = ""
-	result.Text = ""
-	statusLabel.Text = ""
-	bottom.Text = ""
-	card.BackgroundTransparency = 0 -- keep solid when visible
-end
-
-local function showWaiting()
-	gui.Enabled = true
-	card.Visible = true
-	card.BackgroundTransparency = 0
-
-	statusLabel.Visible = true
-	statusLabel.Text = "Waiting For Players"
-
-	rolling.Visible = false
-	rolling.Text = ""
-	result.Visible = false
-	result.Text = ""
-
-	bottom.Text = "Preparing..."
-end
-
-local function updateWaiting(payload)
-	if not gui.Enabled or not statusLabel.Visible then
-		showWaiting()
-	end
-	statusLabel.Text = string.format("Ready %d / %d", payload.ready or 0, payload.expected or 0)
-	bottom.Text = string.format("Starting in %ds  Present %d", payload.secondsLeft or 0, payload.present or 0)
-end
-
-local function hideWaiting()
-	statusLabel.Visible = false
-	statusLabel.Text = ""
-	bottom.Text = ""
-	gui.Enabled = false
-	card.Visible = false
-end
-
--- Collect all GUI objects we can fade
-local function collectFadeTargets(root)
+-- Fade utility
+local function collectGuiTargets(root)
 	local list = {}
 	for _, d in ipairs(root:GetDescendants()) do
-		if d:IsA("GuiObject") then
-			table.insert(list, d)
-		end
+		if d:IsA("GuiObject") then table.insert(list, d) end
 	end
 	return list
 end
-
--- Fade the entire GUI (text, images, backgrounds, strokes) then hide & restore originals
-local function fadeOutGuiThenHide(root, duration)
+local function fadeOutGuiThenHide(gui, duration)
 	duration = duration or 0.6
-	local tweens = {}
-	local originals = {}
-
+	local tweens, originals = {}, {}
 	local function addTween(inst, prop, toValue)
 		local fromValue = inst[prop]
-		originals[#originals+1] = {inst = inst, prop = prop, value = fromValue}
-		local tween = TweenService:Create(inst, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {[prop] = toValue})
-		table.insert(tweens, tween)
-		return tween
+		table.insert(originals, {inst=inst, prop=prop, value=fromValue})
+		local tw = TweenService:Create(inst, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {[prop]=toValue})
+		table.insert(tweens, tw)
+		return tw
 	end
-
-	for _, g in ipairs(collectFadeTargets(root)) do
-		-- Background
-		if g:IsA("Frame") or g:IsA("TextLabel") or g:IsA("TextButton") or g:IsA("ImageLabel") or g:IsA("ImageButton") or g:IsA("ScrollingFrame") then
-			if g.BackgroundTransparency < 1 then
-				addTween(g, "BackgroundTransparency", 1)
-			end
+	for _, g in ipairs(collectGuiTargets(gui)) do
+		if g.BackgroundTransparency < 1 then addTween(g, "BackgroundTransparency", 1) end
+		if (g:IsA("ImageLabel") or g:IsA("ImageButton")) and g.Image ~= "" and g.ImageTransparency < 1 then
+			addTween(g, "ImageTransparency", 1)
 		end
-		-- Images
-		if (g:IsA("ImageLabel") or g:IsA("ImageButton")) and g.Image ~= "" then
-			if g.ImageTransparency < 1 then
-				addTween(g, "ImageTransparency", 1)
-			end
-		end
-		-- Text
 		if (g:IsA("TextLabel") or g:IsA("TextButton")) and g.Text ~= "" then
-			if g.TextTransparency < 1 then
-				addTween(g, "TextTransparency", 1)
-			end
-			if g.TextStrokeTransparency < 1 then
-				addTween(g, "TextStrokeTransparency", 1)
-			end
+			if g.TextTransparency < 1 then addTween(g, "TextTransparency", 1) end
+			if g.TextStrokeTransparency < 1 then addTween(g, "TextStrokeTransparency", 1) end
 		end
-		-- UIStroke (if present)
 		local stroke = g:FindFirstChildOfClass("UIStroke")
-		if stroke and stroke.Transparency < 1 then
-			addTween(stroke, "Transparency", 1)
-		end
+		if stroke and stroke.Transparency < 1 then addTween(stroke, "Transparency", 1) end
 	end
-
 	for _, t in ipairs(tweens) do t:Play() end
 	local elapsed = 0
-	while elapsed < duration do
-		local dt = RunService.Heartbeat:Wait()
-		elapsed += dt
-	end
-
-	-- Hide and restore originals so next round starts pristine
+	while elapsed < duration do elapsed += RunService.Heartbeat:Wait() end
 	gui.Enabled = false
-	card.Visible = false
-	for _, rec in ipairs(originals) do
-		if rec.inst and rec.inst.Parent then
-			rec.inst[rec.prop] = rec.value
+	for _, rec in ipairs(originals) do if rec.inst and rec.inst.Parent then rec.inst[rec.prop] = rec.value end end
+end
+
+-- Animated ellipses for boot
+local ellipsisConn = nil
+local function startEllipsis()
+	if ellipsisConn then return end
+	local dots = {".","..","...","..","."}
+	local idx, acc = 1, 0
+	ellipsisConn = RunService.Heartbeat:Connect(function(dt)
+		acc += dt
+		if acc >= 0.5 then
+			acc = 0
+			idx = (idx % #dots) + 1
+			bootWaitText.Text = "Waiting for players" .. dots[idx]
+		end
+	end)
+end
+local function stopEllipsis()
+	if ellipsisConn then ellipsisConn:Disconnect(); ellipsisConn = nil end
+end
+startEllipsis()
+
+-- ProgressionUI hidden until Active
+local progressionVisibleAllowed = false
+local function applyProgressionVisibility()
+	local gui = pg:FindFirstChild("ProgressionUI")
+	if gui then
+		if gui:IsA("ScreenGui") then
+			gui.Enabled = progressionVisibleAllowed
+		elseif gui:IsA("GuiObject") then
+			gui.Visible = progressionVisibleAllowed
 		end
 	end
 end
-
--- ==============================
--- Exponential ease-out flip: fast -> slow until reveal
--- ==============================
-local FLIP_WORDS = {"Skinwalker","Human","Human","Skinwalker","Human"}
-local function playFlipAnimation(duration)
-	-- Tweakables
-	local MIN_STEP = 0.03   -- fastest swap interval at the start
-	local MAX_STEP = 0.22   -- slowest near the end
-
-	-- Setup
-	rolling.Visible = true
-	result.Visible  = false
-	statusLabel.Visible = false
-	rolling.Text = "—"
-
-	local start = os.clock()
-	local lastSwap = start
-	local idx = 1
-
-	local function easeOutExpo(p)
-		if p >= 1 then return 1 end
-		return 1 - 2^(-10 * p)
+pg.ChildAdded:Connect(function(child)
+	if child.Name == "ProgressionUI" then
+		if child:IsA("ScreenGui") then child.Enabled = progressionVisibleAllowed
+		elseif child:IsA("GuiObject") then child.Visible = progressionVisibleAllowed end
 	end
+end)
+applyProgressionVisibility()
 
-	while true do
-		local t = os.clock() - start
-		if t >= duration then break end
+-- Roll animation container
+local rollContainer = card:FindFirstChild("RollContainer")
+if not rollContainer then
+	rollContainer = Instance.new("Frame")
+	rollContainer.Name = "RollContainer"
+	rollContainer.AnchorPoint = Vector2.new(0.5, 0.5)
+	rollContainer.Position = UDim2.fromScale(0.5, 0.35)
+	rollContainer.Size = UDim2.fromOffset(500, 120)
+	rollContainer.BackgroundTransparency = 1
+	rollContainer.ClipsDescendants = true
+	rollContainer.ZIndex = 18
+	rollContainer.Parent = card
 
-		local p = math.clamp(t / duration, 0, 1)
-		local eased = easeOutExpo(p)
-		local step = MIN_STEP + (MAX_STEP - MIN_STEP) * eased
+	local list = Instance.new("Frame")
+	list.Name = "List"
+	list.Size = UDim2.new(1,0,0, 120*6)
+	list.BackgroundTransparency = 1
+	list.Parent = rollContainer
 
-		if os.clock() - lastSwap >= step then
-			idx = (idx % #FLIP_WORDS) + 1
-			rolling.Text = FLIP_WORDS[idx]
-			lastSwap = os.clock()
-		end
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Vertical
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = list
 
-		RunService.Heartbeat:Wait()
+	local function addRow(text)
+		local lbl = Instance.new("TextLabel")
+		lbl.Size = UDim2.new(1, 0, 0, 120)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamBlack
+		lbl.TextScaled = true
+		lbl.TextColor3 = Color3.new(1,1,1)
+		lbl.TextStrokeTransparency = 0.4
+		lbl.Text = text
+		lbl.ZIndex = 18
+		lbl.Parent = list
+	end
+	addRow("HUMAN"); addRow("SKINWALKER"); addRow("HUMAN")
+	addRow("SKINWALKER"); addRow("HUMAN"); addRow("SKINWALKER")
+end
+
+local function playRollAnimation(duration)
+	duration = duration or 3.0
+	roleGui.Enabled = true
+	card.Visible = true
+	rollContainer.Visible = true
+	statusLabel.Visible = false
+	rolling.Visible = false
+	result.Visible = false
+	bottom.Text = "Determining your role..."
+
+	local list = rollContainer:FindFirstChild("List")
+	list.Position = UDim2.fromOffset(0, 0)
+	local totalHeight = list.AbsoluteSize.Y
+	local rowHeight = totalHeight / 6
+	local target = -(rowHeight * 5 + rowHeight * 0.6)
+
+	local tween = TweenService:Create(
+		list,
+		TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Position = UDim2.fromOffset(0, target) }
+	)
+	tween:Play()
+	local elapsed = 0
+	while elapsed < duration do elapsed += RunService.Heartbeat:Wait() end
+	list.Position = UDim2.fromOffset(0, -(rowHeight * 6))
+end
+
+local function hideRoleAll()
+	roleGui.Enabled = false
+	card.Visible = false
+	rollContainer.Visible = false
+	rolling.Visible = false
+	result.Visible = false
+	statusLabel.Visible = false
+	rolling.Text = ""
+	result.Text = ""
+	statusLabel.Text = ""
+	bottom.Text = ""
+	card.BackgroundTransparency = 0
+end
+
+-- New de-dup state per reveal
+local currentRevealUid = -1
+local seenBegin = false
+local seenRoles = false
+local function ensureReveal(uid)
+	if uid ~= currentRevealUid then
+		currentRevealUid = uid
+		seenBegin = false
+		seenRoles = false
 	end
 end
 
@@ -224,71 +247,96 @@ end
 RoundPhase.OnClientEvent:Connect(function(msg)
 	local phase = msg.phase
 	local p     = msg.payload or {}
+	local uid   = tonumber(p.reveal_uid) or -1
+	clog("Phase=%s", tostring(phase))
 
 	if phase == "Waiting" then
 		setControlsEnabled(false)
-		hideAll()
-		showWaiting()
+		progressionVisibleAllowed = false
+		applyProgressionVisibility()
+
+		hideRoleAll()
+		bootGui.Enabled = true
+		bootWaitText.Text = "Waiting for players."
+		bootSub.Text = ("Ready %d / %d   Present %d   Starting soon"):format(0, p.expected or 0, 0)
 
 	elseif phase == "WaitingUpdate" then
-		updateWaiting(p)
+		bootSub.Text = ("Ready %d / %d   Present %d   Starting in %ds"):format(
+			p.ready or 0, p.expected or 0, p.present or 0, p.secondsLeft or 0
+		)
 
 	elseif phase == "WaitingEnd" then
-		-- Kill waiting visuals before acknowledging
-		hideWaiting()
+		ensureReveal(uid)
+		progressionVisibleAllowed = false
+		applyProgressionVisibility()
+		stopEllipsis()
+		fadeOutGuiThenHide(bootGui, 0.25)
 		task.defer(function()
 			pcall(function() ClientAck:FireServer({phase = "WaitingEnd"}) end)
 		end)
 
 	elseif phase == "RevealBegin" then
-		-- Clean slate for reveal
-		gui.Enabled = true
-		card.Visible = true
-		card.BackgroundTransparency = 0
+		ensureReveal(uid)
+		if seenBegin then return end
+		seenBegin = true
 
-		statusLabel.Visible = false
-		statusLabel.Text = ""
+		if bootGui.Enabled then
+			stopEllipsis()
+			fadeOutGuiThenHide(bootGui, 0.2)
+		end
+		progressionVisibleAllowed = false
+		applyProgressionVisibility()
+		playRollAnimation(p.roll or 3.0)
 
-		result.Visible = false
-		result.Text = ""
-		bottom.Text = "Determining your role..."
-		playFlipAnimation(p.flip or 3.0)
+	elseif phase == "RevealRoles" then
+		ensureReveal(uid)
+		if seenRoles then return end
+		seenRoles = true
 
-	elseif phase == "RevealRole" then
-		rolling.Visible = false
-		rolling.Text = ""
-		statusLabel.Visible = false
-		statusLabel.Text = ""
+		local map = p.assignments or {}
+		local myRole = map[tostring(player.UserId)] or "Human"
 
+		rollContainer.Visible = false
 		result.Visible  = true
-		result.Text     = "You are a ...\n" .. tostring(p.role or "Human")
-
+		local upper = tostring(myRole):upper()
+		result.Text = "You are a …\n" .. upper
+		clog("RevealRoles received (shared) = %s", upper)
 		if sfx and sfx.SoundId and sfx.SoundId ~= "" then
 			pcall(function() sfx.TimePosition = 0; sfx:Play() end)
 		end
-		-- No fade here; we fade the whole GUI only when gameplay starts (Active)
 
 	elseif phase == "Active" then
-		-- Fade the entire GUI, then hide & unlock
-		fadeOutGuiThenHide(gui, 0.6)
+		ensureReveal(uid)
+		progressionVisibleAllowed = true
+		applyProgressionVisibility()
+		fadeOutGuiThenHide(roleGui, 0.4)
 		setControlsEnabled(true)
 
 	elseif phase == "RoundEnd" then
-		-- If the round is force-ended during reveal/waiting, fade out as well
-		fadeOutGuiThenHide(gui, 0.4)
+		progressionVisibleAllowed = false
+		applyProgressionVisibility()
+		stopEllipsis()
+		if bootGui.Enabled then fadeOutGuiThenHide(bootGui, 0.2) end
+		fadeOutGuiThenHide(roleGui, 0.2)
 		setControlsEnabled(true)
 	end
 end)
 
--- Tell server we're ready after spawn/UI mount
+-- Ready handshake
+local firedReady = false
 local function fireReadyOnce()
+	if firedReady then return end
+	firedReady = true
 	task.defer(function()
 		local character = player.Character or player.CharacterAdded:Wait()
 		character:WaitForChild("Humanoid")
 		task.wait(0.25)
+		clog("ClientReady → sending")
 		pcall(function() ClientReady:FireServer() end)
 	end)
 end
-
 if player.Character then fireReadyOnce() end
-player.CharacterAdded:Connect(fireReadyOnce)
+player.CharacterAdded:Connect(function()
+	firedReady = false
+	fireReadyOnce()
+end)

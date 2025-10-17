@@ -1,0 +1,400 @@
+-- ServerScriptService/RoundServer.server.lua
+-- 7s boot screen minimum; 5s reveal 3s roll + 2s hold
+-- Single-shot reveal with stable assignments and verbose logging. Broadcasts one shared map so everyone flips at the same instant.
+-- Now includes a StartReveal gate and reveal_uid tagging to prevent duplicate RevealBegin or RevealRoles.
+
+local Players      = game:GetService("Players")
+local RS           = game:GetService("ReplicatedStorage")
+
+-- ===== Remotes / API scaffolding =====
+local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
+Remotes.Name = "Remotes"
+Remotes.Parent = RS
+
+local function ensureRemote(name, class)
+	class = class or "RemoteEvent"
+	local r = Remotes:FindFirstChild(name)
+	if not r then r = Instance.new(class); r.Name = name; r.Parent = Remotes end
+	return r
+end
+
+local RoundPhase     = ensureRemote("RoundPhase", "RemoteEvent")
+local ClientReadyEvt = ensureRemote("ClientReady", "RemoteEvent")
+local ClientAckEvt   = ensureRemote("ClientAck", "RemoteEvent")
+
+local RoundAPI      = RS:FindFirstChild("RoundAPI") or Instance.new("Folder")
+RoundAPI.Name       = "RoundAPI"
+RoundAPI.Parent     = RS
+local StartRoundFn  = RoundAPI:FindFirstChild("StartRoundFn") or Instance.new("BindableFunction")
+StartRoundFn.Name   = "StartRoundFn"
+StartRoundFn.Parent = RoundAPI
+local ResetRoundFn  = RoundAPI:FindFirstChild("ResetRoundFn") or Instance.new("BindableFunction")
+ResetRoundFn.Name   = "ResetRoundFn"
+ResetRoundFn.Parent = RoundAPI
+
+-- ===== Modules & baseline state =====
+local Modules      = RS:WaitForChild("Modules")
+local RoleService  = require(Modules:WaitForChild("RoleService"))
+local RoundService = require(Modules:WaitForChild("RoundService"))
+RoundService.State = RoundService.State or "Idle"
+
+-- ===== Tunables =====
+local BOOT_MIN_SECONDS    = 7       -- loading screen minimum
+local BOOT_HARD_TIMEOUT   = 45      -- safety timeout
+local STRICT_WAIT_FOR_ALL = true    -- wait for all expected players
+
+-- 5s total reveal
+local REVEAL_ROLL_SECONDS = 3.0
+local REVEAL_HOLD_SECONDS = 2.0
+
+-- ===== Internal state =====
+local ROUND_ACTIVE   = false
+local REVEAL_STARTED = false
+local SKINWALKER     = nil
+local ASSIGNMENTS    = {}            -- userId -> "Skinwalker" or "Human"
+local expectedFromTeleportGlobal = nil
+local firstJoinAt    = nil
+local readySet       = {}
+local waitingAcks    = {}
+local waitingTickerRunning = false
+local waitingStopped = false
+
+-- New single-entry gate and uid tracking
+local StartRevealGate = Instance.new("BindableEvent")
+local REVEAL_UID_COUNTER = 0
+local LAST_REVEAL_UID = 0
+
+-- ===== Logging helpers =====
+local function slog(fmt, ...)
+	print(string.format("[Round %.2f] "..fmt, os.clock(), ...))
+end
+local function listNames(players)
+	local t = {}
+	for _,p in ipairs(players) do table.insert(t, string.format("%s(%d)", p.Name, p.UserId)) end
+	return table.concat(t, ", ")
+end
+
+-- ===== Utils =====
+local function SafeSetRole(p, role)
+	if RoleService.SetRole then pcall(function() RoleService.SetRole(p, role) end) end
+end
+local function presentPlayers()
+	return Players:GetPlayers()
+end
+local function broadcastPhase(phase, payload)
+	RoundPhase:FireAllClients({phase = phase, payload = payload or {}})
+end
+
+-- ===== Round termination =====
+local function EndRound(reason)
+	if not ROUND_ACTIVE and RoundService.State ~= "Revealing" and RoundService.State ~= "Waiting" then return end
+	ROUND_ACTIVE = false
+	REVEAL_STARTED = false
+	SKINWALKER = nil
+	ASSIGNMENTS = {}
+	readySet = {}
+	waitingAcks = {}
+	waitingStopped = true
+	RoundService.State = "Ended"
+	slog("RoundEnd reason=%s", tostring(reason or "RoundOver"))
+	broadcastPhase("RoundEnd", {reason = reason or "RoundOver"})
+end
+
+-- ===== Reveal single-shot, stable roles, shared broadcast =====
+local function startRevealSerialized()
+	if REVEAL_STARTED then
+		slog("startRevealSerialized() ignored already started")
+		return
+	end
+	REVEAL_STARTED = true
+	waitingStopped = true
+
+	-- assign a unique id for this reveal
+	REVEAL_UID_COUNTER += 1
+	local RUID = REVEAL_UID_COUNTER
+	LAST_REVEAL_UID = RUID
+
+	RoundService.State = "Transition"
+	waitingAcks = {}
+	slog("WaitingEnd → requesting ACKs from %s", listNames(presentPlayers()))
+	broadcastPhase("WaitingEnd", { reveal_uid = RUID })
+
+	-- brief ACK window
+	local deadline = os.clock() + 1.0
+	repeat
+		local allAck = true
+		for _, plr in ipairs(presentPlayers()) do
+			if not waitingAcks[plr.UserId] then allAck = false break end
+		end
+		if allAck then break end
+		task.wait(0.05)
+	until os.clock() >= deadline
+
+	-- assign roles exactly once
+	local lobby = presentPlayers()
+	if #lobby == 0 then
+		slog("No players present at reveal; returning to Idle")
+		REVEAL_STARTED = false
+		RoundService.State = "Idle"
+		return
+	end
+
+	ASSIGNMENTS = {}
+	local readyList, notReadyList = {}, {}
+	for _, p in ipairs(lobby) do
+		if readySet[p.UserId] then table.insert(readyList, p) else table.insert(notReadyList, p) end
+	end
+	local candidates = (#readyList > 0) and readyList or lobby
+
+	-- Choose Skinwalker once, with a hard fallback so there is ALWAYS one
+	SKINWALKER = RoleService.AssignOneSkinwalker(candidates)
+	if not SKINWALKER then
+		SKINWALKER = candidates[math.random(1, #candidates)]
+		slog("AssignOneSkinwalker returned nil; falling back to %s(%d)", SKINWALKER.Name, SKINWALKER.UserId)
+	end
+
+	for _, p in ipairs(lobby) do
+		ASSIGNMENTS[p.UserId] = (p == SKINWALKER) and "Skinwalker" or "Human"
+	end
+
+	-- Apply once authoritative
+	for _, p in ipairs(lobby) do SafeSetRole(p, ASSIGNMENTS[p.UserId]) end
+
+	-- Log pretty
+	slog("Assignments: %s", (function()
+		local parts = {}
+		for _, p in ipairs(lobby) do
+			table.insert(parts, string.format("%s→%s", p.Name, ASSIGNMENTS[p.UserId]))
+		end
+		return table.concat(parts, " | ")
+	end)())
+
+	-- begin reveal roll
+	RoundService.State = "Revealing"
+	slog("RevealBegin roll=%.2fs hold=%.2fs", REVEAL_ROLL_SECONDS, REVEAL_HOLD_SECONDS)
+	broadcastPhase("RevealBegin", { reveal_uid = RUID, roll = REVEAL_ROLL_SECONDS, hold = REVEAL_HOLD_SECONDS })
+
+	-- After the roll, broadcast ALL roles in one payload so clients flip at the same instant
+	task.delay(REVEAL_ROLL_SECONDS, function()
+		local payloadAssignments = {}
+		for userId, role in pairs(ASSIGNMENTS) do
+			payloadAssignments[tostring(userId)] = role
+		end
+
+		slog("RevealRoles → broadcasting to %d clients", #presentPlayers())
+		broadcastPhase("RevealRoles", { reveal_uid = RUID, assignments = payloadAssignments, hold = REVEAL_HOLD_SECONDS })
+
+		-- Transition to Active after the shared hold period
+		task.delay(REVEAL_HOLD_SECONDS, function()
+			RoundService.State = "Active"
+			ROUND_ACTIVE = true
+			slog("Active → gameplay start")
+			broadcastPhase("Active", { reveal_uid = RUID })
+		end)
+	end)
+end
+
+-- StartReveal single-entry gate
+StartRevealGate.Event:Connect(function()
+	if REVEAL_STARTED then
+		slog("StartRevealGate ignored duplicate request")
+		return
+	end
+	startRevealSerialized()
+end)
+
+-- ===== Boot loop 7s min + wait for all ready or timeout =====
+local function runBootLoop()
+	if waitingTickerRunning then return end
+	waitingTickerRunning = true
+	waitingStopped = false
+	RoundService.State = "Waiting"
+
+	local now = os.clock()
+	local minGateAt = now + BOOT_MIN_SECONDS
+	local hardTimeoutAt = now + BOOT_HARD_TIMEOUT
+
+	local expected = expectedFromTeleportGlobal or math.max(1, #presentPlayers())
+	slog("Waiting start: expected=%d minGate=+%ds timeout=+%ds", expected, BOOT_MIN_SECONDS, BOOT_HARD_TIMEOUT)
+
+	broadcastPhase("Waiting", {
+		seconds = BOOT_MIN_SECONDS,
+		expected = expected,
+		roll = REVEAL_ROLL_SECONDS,
+		hold = REVEAL_HOLD_SECONDS
+	})
+
+	while not waitingStopped do
+		task.wait(1)
+
+		local pres = presentPlayers()
+		local readyCount = 0
+		for _, plr in ipairs(pres) do
+			if readySet[plr.UserId] then readyCount += 1 end
+		end
+
+		local leftToMin = math.max(0, math.ceil(minGateAt - os.clock()))
+		broadcastPhase("WaitingUpdate", {
+			expected    = expected,
+			present     = #pres,
+			ready       = readyCount,
+			secondsLeft = leftToMin
+		})
+
+		slog("Waiting tick: present=%d ready=%d/%d leftToMin=%d",
+			#pres, readyCount, expected, leftToMin)
+
+		local minElapsed = os.clock() >= minGateAt
+		local everyoneReady = readyCount >= math.max(1, expected)
+
+		if STRICT_WAIT_FOR_ALL then
+			if minElapsed and everyoneReady and #pres >= 1 then
+				slog("Waiting → conditions met; starting reveal")
+				waitingTickerRunning = false
+				StartRevealGate:Fire()
+				return
+			end
+		else
+			if minElapsed and #pres >= 1 then
+				slog("Waiting → min gate met; starting reveal")
+				waitingTickerRunning = false
+				StartRevealGate:Fire()
+				return
+			end
+		end
+
+		if os.clock() >= hardTimeoutAt then
+			slog("Waiting → hard timeout; forcing reveal")
+			waitingTickerRunning = false
+			if #pres >= 1 then
+				StartRevealGate:Fire()
+			else
+				waitingStopped = true
+				RoundService.State = "Idle"
+			end
+			return
+		end
+	end
+
+	waitingTickerRunning = false
+end
+
+-- ===== API =====
+local function StartRoundInternal()
+	if ROUND_ACTIVE or REVEAL_STARTED then
+		slog("StartRound ignored ROUND_ACTIVE=%s REVEAL_STARTED=%s", tostring(ROUND_ACTIVE), tostring(REVEAL_STARTED))
+		return
+	end
+	StartRevealGate:Fire()
+end
+local function ResetRoundInternal()
+	RoleService.ClearAll(Players:GetPlayers())
+	SKINWALKER = nil
+	ASSIGNMENTS = {}
+	ROUND_ACTIVE = false
+	REVEAL_STARTED = false
+	readySet = {}
+	waitingAcks = {}
+	waitingStopped = true
+	RoundService.State = "Idle"
+	slog("ResetRound → Idle")
+end
+StartRoundFn.OnInvoke = function() StartRoundInternal() end
+ResetRoundFn.OnInvoke = function() ResetRoundInternal() end
+
+-- ===== Joins & Signals =====
+Players.PlayerAdded:Connect(function(p)
+	if not firstJoinAt then firstJoinAt = os.clock() end
+
+	local jd = p:GetJoinData()
+	local tp = jd and jd.TeleportData
+	if tp and tp.startRound then
+		local got = tonumber(tp.expected) or 1
+		if not expectedFromTeleportGlobal or got > expectedFromTeleportGlobal then
+			expectedFromTeleportGlobal = got
+		end
+	end
+
+	slog("PlayerAdded %s(%d) tp.expected=%s", p.Name, p.UserId, tostring(expectedFromTeleportGlobal))
+
+	if RoundService.State == "Idle" or RoundService.State == "Waiting" then
+		runBootLoop()
+	end
+
+	if RoundService.State == "Revealing" or ROUND_ACTIVE then
+		-- late join: never steal the Skinwalker; force Human reveal mini sequence using shared payload shape
+		local role = "Human"
+		SafeSetRole(p, role)
+		local uid = LAST_REVEAL_UID > 0 and LAST_REVEAL_UID or REVEAL_UID_COUNTER
+
+		if RoundService.State == "Revealing" then
+			task.defer(function()
+				RoundPhase:FireClient(p, {phase = "RevealBegin", payload = { reveal_uid = uid, roll = 0.4, hold = 0.8 }})
+				task.delay(0.4, function()
+					local map = {[tostring(p.UserId)] = role}
+					RoundPhase:FireClient(p, {phase = "RevealRoles", payload = { reveal_uid = uid, assignments = map, hold = 0.8 }})
+				end)
+			end)
+		else -- Active
+			task.defer(function()
+				local map = {[tostring(p.UserId)] = role}
+				RoundPhase:FireClient(p, {phase = "RevealRoles", payload = { reveal_uid = uid, assignments = map, hold = 0.5 }})
+				task.delay(0.5, function()
+					RoundPhase:FireClient(p, {phase = "Active", payload = { reveal_uid = uid }})
+				end)
+			end)
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	readySet[p.UserId] = nil
+	waitingAcks[p.UserId] = nil
+
+	-- If the Skinwalker leaves during the reveal window, reassign to keep exactly one
+	if RoundService.State == "Revealing" and SKINWALKER and p == SKINWALKER then
+		local pres = presentPlayers()
+		for i = #pres, 1, -1 do
+			if pres[i] == p then table.remove(pres, i) end
+		end
+		if #pres >= 1 then
+			SKINWALKER = pres[math.random(1, #pres)]
+			ASSIGNMENTS = {}
+			for _, pl in ipairs(pres) do
+				ASSIGNMENTS[pl.UserId] = (pl == SKINWALKER) and "Skinwalker" or "Human"
+				SafeSetRole(pl, ASSIGNMENTS[pl.UserId])
+			end
+			slog("Skinwalker left; reassigned to %s(%d) before RevealRoles broadcast", SKINWALKER.Name, SKINWALKER.UserId)
+		else
+			SKINWALKER = nil
+		end
+	end
+
+	slog("PlayerRemoving %s(%d)", p.Name, p.UserId)
+end)
+
+ClientReadyEvt.OnServerEvent:Connect(function(player)
+	readySet[player.UserId] = true
+
+	if RoundService.State == "Waiting" and not REVEAL_STARTED then
+		local expected = expectedFromTeleportGlobal or #presentPlayers()
+		local readyCount = 0
+		for _, plr in ipairs(presentPlayers()) do if readySet[plr.UserId] then readyCount += 1 end end
+		local minElapsed = firstJoinAt and (os.clock() - firstJoinAt) >= BOOT_MIN_SECONDS
+		slog("ClientReady from %s(%d) ready=%d/%d minElapsed=%s",
+			player.Name, player.UserId, readyCount, expected, tostring(minElapsed))
+
+		if minElapsed and readyCount >= math.max(1, expected) then
+			slog("All ready after min gate → starting reveal")
+			StartRevealGate:Fire()
+		end
+	end
+end)
+
+ClientAckEvt.OnServerEvent:Connect(function(player, data)
+	data = data or {}
+	if data.phase == "WaitingEnd" then
+		waitingAcks[player.UserId] = true
+		slog("ACK WaitingEnd from %s(%d)", player.Name, player.UserId)
+	end
+end)
