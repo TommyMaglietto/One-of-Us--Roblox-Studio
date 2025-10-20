@@ -9,9 +9,8 @@ local TweenService       = game:GetService("TweenService")
 
 ReplicatedFirst:RemoveDefaultLoadingScreen()
 
--- Customize these two
-local BACKGROUND_IMAGE_ID = "rbxassetid://0000000000"
-local DARK_RED            = Color3.fromRGB(77, 0, 0)
+-- Only color is configurable here (we don't touch your Stage2.Background.Image)
+local DARK_RED = Color3.fromRGB(77, 0, 0)
 
 local function findGuiFolder()
 	return ReplicatedFirst:FindFirstChild("LoadingGuis")
@@ -22,14 +21,13 @@ local function tween(inst, t, props, style, dir)
 	return TweenService:Create(inst, TweenInfo.new(t, style or Enum.EasingStyle.Quad, dir or Enum.EasingDirection.Out), props)
 end
 
-local function setTreeTransparency(guiObj, alpha)
-	for _, d in ipairs(guiObj:GetDescendants()) do
+-- Fade helper: ONLY images/text, never frame backgrounds (prevents covering your bg)
+local function setUIAlpha(container, a)
+	for _, d in ipairs(container:GetDescendants()) do
 		if d:IsA("ImageLabel") or d:IsA("ImageButton") then
-			d.ImageTransparency = alpha
+			d.ImageTransparency = a
 		elseif d:IsA("TextLabel") or d:IsA("TextButton") then
-			d.TextTransparency = alpha
-		elseif d:IsA("Frame") then
-			d.BackgroundTransparency = alpha
+			d.TextTransparency = a
 		end
 	end
 end
@@ -65,9 +63,7 @@ local function getControls()
 	if not ps then return nil end
 	local pm = ps:FindFirstChild("PlayerModule") or ps:WaitForChild("PlayerModule")
 	local ok, module = pcall(require, pm)
-	if ok and module and module.GetControls then
-		return module:GetControls()
-	end
+	if ok and module and module.GetControls then return module:GetControls() end
 	return nil
 end
 local function lockMovement()
@@ -87,7 +83,7 @@ local function unlockMovement(hum)
 	releaseLock(hum)
 end
 
--- Preload plumbing
+-- Preload (background thread; Stage 2 subscribes)
 local function collectAssets()
 	local interesting = {
 		Decal=true, Texture=true, SurfaceAppearance=true,
@@ -105,17 +101,14 @@ local function collectAssets()
 	end
 	return list
 end
-
 local function niceName(obj)
 	local n = obj.Name ~= "" and obj.Name or obj.ClassName
 	return string.format("%s [%s]", n, obj.ClassName)
 end
 
 local ProgressEvent = Instance.new("BindableEvent")
-local totalAssets = 1
-local loadedCount = 0
-local lastLabel = "Preparing"
-local preloadDone = false
+local totalAssets, loadedCount = 1, 0
+local lastLabel, preloadDone = "Preparing", false
 
 local function startBackgroundPreload(extraWarm)
 	task.spawn(function()
@@ -138,23 +131,19 @@ end
 -- Get templates
 local folder = findGuiFolder()
 if not folder then
-	warn("[BootLoader] LoadingGuis not found in ReplicatedFirst or ReplicatedStorage.")
+	warn("[BootLoader] LoadingGuis not found; creating a placeholder.")
 	folder = Instance.new("Folder"); folder.Name = "LoadingGuis"; folder.Parent = ReplicatedFirst
 end
 local stage1Template = folder:FindFirstChild("Stage1Template")
 local stage2Template = folder:FindFirstChild("Stage2Template")
 assert(stage1Template and stage2Template, "[BootLoader] Missing Stage1Template or Stage2Template in LoadingGuis")
 
--- Clone to PlayerGui
+-- Clone to PlayerGui (Stage 2 enabled from the start, under Stage 1)
 local pg = LocalPlayer:WaitForChild("PlayerGui")
-local stage1 = stage1Template:Clone(); stage1.Name = "Stage1"; stage1.Parent = pg
-local s1Frame = stage1:WaitForChild("Stage1")
-local s1Img   = s1Frame:FindFirstChild("StudioImage")
-local s1Text  = s1Frame:FindFirstChild("StudioText")
 
-local stage2 = stage2Template:Clone(); stage2.Name = "Stage2"; stage2.Enabled = false; stage2.Parent = pg
+local stage2 = stage2Template:Clone(); stage2.Name = "Stage2"; stage2.Enabled = true; stage2.DisplayOrder = 9999; stage2.Parent = pg
 local s2Frame   = stage2:WaitForChild("Stage2")
-local bgImage   = s2Frame:FindFirstChild("Background")
+local bgImage   = s2Frame:FindFirstChild("Background") -- we do NOT touch its Image
 local title     = s2Frame:FindFirstChild("Title")
 local barHolder = s2Frame:FindFirstChild("BarHolder")
 local barBG     = barHolder and barHolder:FindFirstChild("BG")
@@ -162,39 +151,58 @@ local barFill   = barBG and barBG:FindFirstChild("Fill")
 local percent   = barHolder and barHolder:FindFirstChild("PercentLabel")
 local statusL   = s2Frame:FindFirstChild("StatusLabel")
 
--- Apply runtime parameters
-if bgImage then bgImage.Image = BACKGROUND_IMAGE_ID end
-if title then title.TextColor3 = DARK_RED end
-if barFill then barFill.BackgroundColor3 = DARK_RED; barFill.Size = UDim2.new(0,0,1,0) end
-if percent then percent.Text = "0%" end
-if statusL then statusL.Text = "Preparing" end
+-- Initialize Stage 2 visuals: invisible but present underneath
+if s2Frame then s2Frame.BackgroundTransparency = 1 end
+if bgImage then bgImage.ZIndex = 0; bgImage.ImageTransparency = 1 end
+if title then title.ZIndex = 2; title.TextColor3 = DARK_RED; title.TextTransparency = 1 end
+if barHolder then barHolder.ZIndex = 2 end
+if barBG then barBG.BackgroundTransparency = 1 end
+if barFill then barFill.BackgroundColor3 = DARK_RED; barFill.BackgroundTransparency = 1; barFill.Size = UDim2.new(0,0,1,0) end
+if percent then percent.Text = "0%"; percent.TextTransparency = 1 end
+if statusL then statusL.Text = "Preparing"; statusL.TextTransparency = 1 end
+
+-- Stage 1 on top
+local stage1 = stage1Template:Clone(); stage1.Name = "Stage1"; stage1.Enabled = true; stage1.DisplayOrder = 10000; stage1.Parent = pg
+local s1Frame = stage1:WaitForChild("Stage1")
+local s1Img   = s1Frame:FindFirstChild("StudioImage")
+local s1Text  = s1Frame:FindFirstChild("StudioText")
 
 -- Lock movement before showing anything
 local lockedHumanoid = lockMovement()
 
--- Stage 1 show 3 seconds and start preloading
-setTreeTransparency(s1Frame, 1)
-tween(s1Frame, 0.45, {BackgroundTransparency = 0}):Play()
-task.wait(0.05)
-if s1Img  then tween(s1Img,  0.55, {ImageTransparency = 0}):Play() end
-if s1Text then tween(s1Text, 0.55, {TextTransparency = 0}):Play() end
-
+-- Start preloading while Stage 1 is visible (warm both key images)
 local warmAssets = {}
 if s1Img then table.insert(warmAssets, s1Img) end
 if bgImage then table.insert(warmAssets, bgImage) end
 startBackgroundPreload(warmAssets)
 
+-- ===== Stage 1 fade-in =====
+setUIAlpha(s1Frame, 1)
+tween(s1Frame, 0.45, {BackgroundTransparency = 0}):Play()
+task.wait(0.05)
+if s1Img  then tween(s1Img,  0.55, {ImageTransparency = 0}):Play() end
+if s1Text then tween(s1Text, 0.55, {TextTransparency = 0}):Play() end
+
+-- Hold 3s
 task.wait(3.0)
+
+-- ===== Cross-fade: Stage 2 fades IN while Stage 1 fades OUT (no gap) =====
+-- Bring Stage 2 visuals in
+if bgImage  then tween(bgImage,  0.45, {ImageTransparency = 0}):Play() end
+if title    then tween(title,    0.45, {TextTransparency   = 0}):Play() end
+if barBG    then tween(barBG,    0.45, {BackgroundTransparency = 0}):Play() end
+if barFill  then tween(barFill,  0.45, {BackgroundTransparency = 0}):Play() end
+if percent  then tween(percent,  0.45, {TextTransparency   = 0}):Play() end
+if statusL  then tween(statusL,  0.45, {TextTransparency   = 0}):Play() end
+
+-- Fade Stage 1 out at the same time
 tween(s1Frame, 0.45, {BackgroundTransparency = 1}):Play()
 if s1Img  then tween(s1Img,  0.45, {ImageTransparency = 1}):Play() end
 if s1Text then tween(s1Text, 0.45, {TextTransparency = 1}):Play() end
 task.wait(0.5)
 stage1:Destroy()
 
--- Stage 2 show and attach to live progress
-stage2.Enabled = true
-setTreeTransparency(s2Frame, 0)
-
+-- ===== Stage 2: live progress =====
 local function applyProgress(i, total, label)
 	local p = math.clamp(i/total, 0, 1)
 	if barFill  then barFill.Size = UDim2.new(p, 0, 1, 0) end
@@ -209,7 +217,7 @@ conn = ProgressEvent.Event:Connect(function(i, total, label)
 	if i >= total and conn then conn:Disconnect() end
 end)
 
--- Wait here until absolutely everything is loaded
+-- Wait until all assets are done
 while not preloadDone do
 	task.wait(0.05)
 end
@@ -218,7 +226,7 @@ end
 applyProgress(totalAssets, totalAssets, "Loading complete")
 task.wait(0.25)
 
--- Fade out and clean up
+-- Fade Stage 2 out & cleanup
 tween(s2Frame, 0.45, {BackgroundTransparency = 1}):Play()
 if bgImage  then tween(bgImage,  0.45, {ImageTransparency = 1}):Play() end
 if title    then tween(title,    0.45, {TextTransparency   = 1}):Play() end
@@ -229,5 +237,5 @@ if statusL  then tween(statusL,  0.45, {TextTransparency   = 1}):Play() end
 task.wait(0.5)
 stage2:Destroy()
 
--- Unlock movement after UI is gone
+-- Unlock movement
 unlockMovement(lockedHumanoid)
