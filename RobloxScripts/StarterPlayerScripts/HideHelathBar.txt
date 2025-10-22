@@ -1,0 +1,16 @@
+-- StarterPlayerScripts/HideHealthBar.client.lua
+local StarterGui = game:GetService("StarterGui")
+
+local function hideHealthBar()
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Health, false)
+	end)
+end
+
+hideHealthBar()
+
+-- optional safety so it stays off after respawn
+game:GetService("Players").LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.1)
+	hideHealthBar()
+end)

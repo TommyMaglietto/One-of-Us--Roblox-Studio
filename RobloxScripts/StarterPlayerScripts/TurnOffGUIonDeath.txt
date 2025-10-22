@@ -1,0 +1,71 @@
+-- StarterPlayerScripts/HideGuiOnDeath.client.lua
+local Players      = game:GetService("Players")
+local StarterGui   = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local pg     = player:WaitForChild("PlayerGui")
+
+local SPECTATE_NAME = "Spectating"
+
+local savedEnabled = {}   -- [ScreenGui] = bool
+local savedCore    = {}   -- [CoreGuiType] = bool
+
+local CORE_TO_HIDE = {
+	Enum.CoreGuiType.Backpack,   -- default toolbar
+	Enum.CoreGuiType.Health,
+}
+
+local function hideAllButSpectating()
+	-- save and disable custom guis
+	savedEnabled = {}
+	for _, gui in ipairs(pg:GetChildren()) do
+		if gui:IsA("ScreenGui") then
+			savedEnabled[gui] = gui.Enabled
+			gui.Enabled = (gui.Name == SPECTATE_NAME)
+		end
+	end
+	local spec = pg:FindFirstChild(SPECTATE_NAME)
+	if spec and spec:IsA("ScreenGui") then
+		spec.Enabled = true
+	end
+
+	-- hide core gui like the toolbar
+	savedCore = {}
+	for _, t in ipairs(CORE_TO_HIDE) do
+		local ok, cur = pcall(function() return StarterGui:GetCoreGuiEnabled(t) end)
+		if ok then savedCore[t] = cur end
+		pcall(function() StarterGui:SetCoreGuiEnabled(t, false) end)
+	end
+end
+
+local function restoreAll()
+	for gui, was in pairs(savedEnabled) do
+		if gui and gui.Parent then
+			gui.Enabled = was
+		end
+	end
+	savedEnabled = {}
+
+	for t, was in pairs(savedCore) do
+		pcall(function() StarterGui:SetCoreGuiEnabled(t, was) end)
+	end
+	savedCore = {}
+end
+
+local function bind(char)
+	local hum = char:WaitForChild("Humanoid")
+	hum.Died:Once(hideAllButSpectating)
+end
+
+if player.Character then bind(player.Character) end
+player.CharacterAdded:Connect(function(char)
+	restoreAll()
+	bind(char)
+end)
+
+-- also hide if your game opens spectate via this remote
+local buyRespawn = ReplicatedStorage:FindFirstChild("BuyRespawn")
+if buyRespawn and buyRespawn:IsA("RemoteEvent") then
+	buyRespawn.OnClientEvent:Connect(hideAllButSpectating)
+end
