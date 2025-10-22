@@ -1,0 +1,53 @@
+-- Listens for AddAmmoHUD and updates the AmmoHUD label text "Ammo: N"
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+
+local Remotes = RS:WaitForChild("Remotes")
+local AddAmmoHUD = Remotes:WaitForChild("AddAmmoHUD")
+
+local player = Players.LocalPlayer
+
+local function getAmmoLabel()
+	local pg = player:WaitForChild("PlayerGui")
+	local hud = pg:WaitForChild("AmmoHUD")
+	local frame = hud:WaitForChild("Frame")
+	return frame:WaitForChild("AmmoLabel")
+end
+
+local function parseTailInt(s)
+	local n = string.match(s or "", "(-?%d+)$")
+	return tonumber(n) or 0
+end
+
+local ammoLabel = nil
+local function ensureLabel()
+	if ammoLabel and ammoLabel.Parent then return ammoLabel end
+	ammoLabel = getAmmoLabel()
+	if ammoLabel:GetAttribute("AmmoCount") == nil then
+		ammoLabel:SetAttribute("AmmoCount", parseTailInt(ammoLabel.Text))
+	end
+	return ammoLabel
+end
+
+local function addAmmo(delta)
+	local lbl = ensureLabel()
+	local count = lbl:GetAttribute("AmmoCount")
+	if type(count) ~= "number" then count = parseTailInt(lbl.Text) end
+	count = count + (tonumber(delta) or 0)
+	lbl:SetAttribute("AmmoCount", count)
+	lbl.Text = "Ammo: " .. tostring(count)
+end
+
+AddAmmoHUD.OnClientEvent:Connect(addAmmo)
+
+-- if GUI reloads, keep last count
+player:WaitForChild("PlayerGui").ChildAdded:Connect(function(child)
+	if child.Name == "AmmoHUD" and ammoLabel and ammoLabel:GetAttribute("AmmoCount") then
+		local keep = ammoLabel:GetAttribute("AmmoCount")
+		ammoLabel = nil
+		local lbl = ensureLabel()
+		lbl:SetAttribute("AmmoCount", keep)
+		lbl.Text = "Ammo: " .. tostring(keep)
+	end
+end)

@@ -1,0 +1,117 @@
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+
+math.randomseed(os.time())
+
+local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
+Remotes.Name = "Remotes"
+Remotes.Parent = RS
+
+local function ensureRemote(name)
+	local r = Remotes:FindFirstChild(name)
+	if not r then
+		r = Instance.new("RemoteEvent")
+		r.Name = name
+		r.Parent = Remotes
+	end
+	return r
+end
+
+local DoneLoading    = ensureRemote("DoneLoading")     -- client -> server
+local ClientReadyEvt = ensureRemote("ClientReady")     -- client -> server
+local LoadingStatus  = ensureRemote("LoadingStatus")   -- server -> clients
+local StartRoulette  = ensureRemote("StartRoulette")   -- server -> client
+
+local RoundState = RS:FindFirstChild("RoundState") or Instance.new("Folder")
+RoundState.Name = "RoundState"
+RoundState.Parent = RS
+
+local RolesFolder = RoundState:FindFirstChild("Roles") or Instance.new("Folder")
+RolesFolder.Name = "Roles"
+RolesFolder.Parent = RoundState
+RolesFolder:ClearAllChildren()
+
+local loaded = {}       -- [Player] = true after DoneLoading
+local clientReady = {}  -- [Player] = true after ClientReady
+local rolesAssigned = false
+
+local function everyoneReady()
+	local list = Players:GetPlayers()
+	if #list == 0 then return false end
+	for _, p in ipairs(list) do
+		if not loaded[p] or not clientReady[p] then
+			return false
+		end
+	end
+	return true
+end
+
+local function countLoaded()
+	local n = 0
+	for _, p in ipairs(Players:GetPlayers()) do
+		if loaded[p] then n += 1 end
+	end
+	return n
+end
+
+local function broadcastStatus()
+	LoadingStatus:FireAllClients(countLoaded(), #Players:GetPlayers())
+end
+
+local function assignRoles()
+	if rolesAssigned then return end
+	local list = Players:GetPlayers()
+	if #list == 0 then return end
+
+	rolesAssigned = true
+	RolesFolder:ClearAllChildren()
+
+	local skinwalker = list[math.random(1, #list)]
+	for _, p in ipairs(list) do
+		local role = (p == skinwalker) and "SKINWALKER" or "HUMAN"
+		local v = Instance.new("StringValue")
+		v.Name = tostring(p.UserId)
+		v.Value = role
+		v.Parent = RolesFolder
+	end
+
+	for _, p in ipairs(list) do
+		local v = RolesFolder:FindFirstChild(tostring(p.UserId))
+		if v then
+			StartRoulette:FireClient(p, v.Value)
+		end
+	end
+end
+
+local function tryStart()
+	if rolesAssigned then return end
+	if everyoneReady() then
+		assignRoles()
+	end
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	loaded[plr] = false
+	clientReady[plr] = false
+	broadcastStatus()
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+	loaded[plr] = nil
+	clientReady[plr] = nil
+	broadcastStatus()
+	tryStart()
+end)
+
+DoneLoading.OnServerEvent:Connect(function(plr)
+	if not plr or not plr.Parent then return end
+	loaded[plr] = true
+	broadcastStatus()
+	tryStart()
+end)
+
+ClientReadyEvt.OnServerEvent:Connect(function(plr)
+	if not plr or not plr.Parent then return end
+	clientReady[plr] = true
+	tryStart()
+end)

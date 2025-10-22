@@ -1,307 +1,378 @@
--- ServerScriptService/SpawnPickupsOnStumps.server.lua
--- Keys: exactly 5 random stumps get a Key
--- Non-key roll per stump: 9Volt 40 percent, Bandages 33 percent, Ammo 10 percent, None 17 percent
--- This version surface-locks items so they sit perfectly on top of each stump using a downward raycast
+-- Spawns pickups on stumps only.
+-- ReplicatedStorage/PickUps must contain Models named exactly: 9Volt, Ammo, Bandages, Key
+-- Effects:
+--   Key, Bandages -> add simple Tools to default toolbar (handleless)
+--   9Volt         -> +20 to flashlight battery NumberValue (clamped 0..100)
+--   Ammo          -> +3 to Ammo HUD via RemoteEvent
+-- De-dup logic ensures at most ONE pickup per stump even if another spawner runs.
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RS        = game:GetService("ReplicatedStorage")
+local Players   = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
+local Http      = game:GetService("HttpService")
 
-local STUMPS_FOLDER = Workspace:WaitForChild("Stumps")
-local PICKUPS_SOURCE = ReplicatedStorage:WaitForChild("PickUps")
+-- ---------------- ICON HELPER ----------------
+-- Looks for ReplicatedStorage/ToolIcons/<ToolName> and pulls an asset id from it.
+-- Supports StringValue, IntValue, NumberValue, ImageLabel, ImageButton, Decal, Texture.
+local ICONS = RS:FindFirstChild("ToolIcons")
 
-local DEST_FOLDER = Workspace:FindFirstChild("SpawnedPickUps") or Instance.new("Folder")
-DEST_FOLDER.Name = "SpawnedPickUps"
-DEST_FOLDER.Parent = Workspace
+local function normalizeAssetId(v)
+	if v == nil or v == "" then return nil end
+	if typeof(v) == "number" then return "rbxassetid://" .. v end
+	if typeof(v) == "string" then
+		if v:match("^%d+$") then return "rbxassetid://" .. v end
+		return v
+	end
+	return nil
+end
 
--- RNG variety per server
+local function extractIconId(iconObj)
+	if not iconObj then return nil end
+	if iconObj:IsA("ImageLabel") or iconObj:IsA("ImageButton") then
+		return normalizeAssetId(iconObj.Image)
+	elseif iconObj:IsA("Decal") or iconObj:IsA("Texture") then
+		return normalizeAssetId(iconObj.Texture)
+	elseif iconObj:IsA("StringValue") then
+		return normalizeAssetId(iconObj.Value)
+	elseif iconObj:IsA("IntValue") or iconObj:IsA("NumberValue") then
+		return normalizeAssetId(iconObj.Value)
+	end
+	return nil
+end
+
+local function getIconIdByName(toolName)
+	if not ICONS then return nil end
+	local obj = ICONS:FindFirstChild(toolName)
+	-- simple fallback for Bandage vs Bandages naming
+	if not obj and toolName == "Bandages" then obj = ICONS:FindFirstChild("Bandage") end
+	if not obj and toolName == "Bandage"  then obj = ICONS:FindFirstChild("Bandages") end
+	if not obj then return nil end
+	return extractIconId(obj)
+end
+
+-- ---------------- LOGGING ----------------
+local ENABLE_LOGS = true
+local function LOG(...)  if ENABLE_LOGS then print("[Pickups]", ...) end end
+local function WARN(...) warn("[Pickups]", ...) end
+
+local SPAWNER_ID = Http:GenerateGUID(false)
+LOG("Spawner starting. ID=", SPAWNER_ID)
+
+-- ---------------- REMOTES ----------------
+local Remotes = RS:FindFirstChild("Remotes") or Instance.new("Folder")
+Remotes.Name = "Remotes"
+Remotes.Parent = RS
+local AddAmmoHUD = Remotes:FindFirstChild("AddAmmoHUD") or Instance.new("RemoteEvent")
+AddAmmoHUD.Name = "AddAmmoHUD"
+AddAmmoHUD.Parent = Remotes
+
+-- ---------------- SOURCES ----------------
+local STUMPS_FOLDER  = Workspace:WaitForChild("Stumps")
+local PICKUPS_SOURCE = RS:WaitForChild("PickUps")
+
+-- Distribution for non-key items
+local NON_KEY_RANGES = {
+	{ name = "9Volt",    low = 1,   high = 40 },
+	{ name = "Bandages", low = 41,  high = 73 },
+	{ name = "Ammo",     low = 74,  high = 83 },
+	{ name = "None",     low = 84,  high = 100 },
+}
+local KEYS_TO_PLACE = 5
+local ADD_RANDOM_YAW = true
+
+local PICKUP_NAMES = { Key=true, Bandages=true, Ammo=true, ["9Volt"]=true }
+
+-- ---------------- UTILS ----------------
 do
 	math.randomseed(tick() % 1e6)
 	for _ = 1, 5 do math.random() end
 end
 
--- Non-key outcomes for the other stumps must cover 1..100
-local NON_KEY_RANGES = {
-	{ name = "9Volt",    low = 1,   high = 40 },  -- 40 percent
-	{ name = "Bandages", low = 41,  high = 73 },  -- 33 percent
-	{ name = "Ammo",     low = 74,  high = 83 },  -- 10 percent
-	{ name = "None",     low = 84,  high = 100 }, -- 17 percent
-}
-
--- Per-item local offsets and rotations applied after centering
--- Positive Y raises, negative Y lowers
-local ITEM_OFFSETS = {
-	Ammo      = Vector3.new(0, 0, 0), -- keep as requested; set to Vector3.new() if you want exact flush
-	Bandages  = Vector3.new(0, 0, 0),
-	["9Volt"] = Vector3.new(0, .38, 0),
-	Key       = Vector3.new(0, 0, 0),
-}
-
--- Optional extra rotation for specific items (degrees)
-local ITEM_ROTATIONS = {
-	Bandages = Vector3.new(0, 0, 0), -- set e.g. Vector3.new(0, 90, 0) if you want a 90 degree yaw
-}
-
--- Placement tuning
-local CLEARANCE_Y     = 0.0      -- zero so items rest exactly on the top surface
-local MAX_LIFT_TRIES  = 5        -- small safety lift only if intersecting non-stump parts
-local LIFT_STEP       = 0.02
-local ADD_RANDOM_YAW  = true
-local STUMP_MARKER_NAME = "PlaceHere"
-
--- Overlap checks should ignore the clone, the chosen stump, and terrain
-local function makeOverlapParams(ignoreList)
-	local p = OverlapParams.new()
-	p.FilterType = Enum.RaycastFilterType.Exclude
-	p.FilterDescendantsInstances = ignoreList
-	return p
-end
-
----------------------------------------------------------------------
--- Helpers
----------------------------------------------------------------------
-
-local function getAnyBasePart(instance)
-	if instance:IsA("BasePart") then return instance end
-	for _, d in ipairs(instance:GetDescendants()) do
+local function getAnyBasePart(inst)
+	if inst:IsA("BasePart") then return inst end
+	for _, d in ipairs(inst:GetDescendants()) do
 		if d:IsA("BasePart") then return d end
 	end
-	return nil
 end
 
-local function ensurePrimaryPart(model)
-	if not model or not model:IsA("Model") then return nil end
-	if model.PrimaryPart and model.PrimaryPart.Parent == model then
-		return model.PrimaryPart
-	end
-	local part = getAnyBasePart(model)
-	if part then
-		model.PrimaryPart = part
-		return part
-	end
-	return nil
-end
-
--- Highest top surface among parts in the stump
-local function getStumpTopPart(stump)
+local function topPartOfStump(stump)
 	if stump:IsA("BasePart") then return stump end
-	local topPart, topY = nil, -math.huge
+	local top, topY = nil, -math.huge
 	for _, p in ipairs(stump:GetDescendants()) do
 		if p:IsA("BasePart") then
-			local thisTop = p.Position.Y + p.Size.Y * 0.5
-			if thisTop > topY then
-				topY = thisTop
-				topPart = p
-			end
+			local y = p.Position.Y + p.Size.Y * 0.5
+			if y > topY then topY = y; top = p end
 		end
 	end
-	return topPart
+	return top
 end
 
--- Optional precision centering via Attachment named PlaceHere anywhere under stump
-local function findStumpMarker(stump)
-	if stump:IsA("Attachment") and stump.Name == STUMP_MARKER_NAME then
-		return stump
+local function placeOnTop(stump, model)
+	if model:IsA("Model") and not model.PrimaryPart then
+		local pp = getAnyBasePart(model)
+		if pp then model.PrimaryPart = pp end
 	end
-	if stump:IsA("BasePart") or stump:IsA("Model") then
-		return stump:FindFirstChild(STUMP_MARKER_NAME, true)
-	end
-	return nil
+	local tp = topPartOfStump(stump)
+	if not tp then return end
+	local yaw = ADD_RANDOM_YAW and math.rad(math.random(0,359)) or 0
+	local _, size = model:GetBoundingBox()
+	local y = tp.Position.Y + tp.Size.Y * 0.5 + size.Y * 0.5
+	local pos = Vector3.new(tp.Position.X, y, tp.Position.Z)
+	model:PivotTo(CFrame.new(pos) * CFrame.Angles(0, yaw, 0))
 end
 
--- Raycast straight down at XZ to find the true top surface Y of this stump
-local function raycastTopY(stump, x, z)
-	local topPart = getStumpTopPart(stump)
-	local startY = topPart and (topPart.Position.Y + topPart.Size.Y + 10) or (Workspace.FallenPartsDestroyHeight + 1000)
-	local origin = Vector3.new(x, startY, z)
-	local direction = Vector3.new(0, -2000, 0)
-
-	local rp = RaycastParams.new()
-	rp.FilterType = Enum.RaycastFilterType.Include
-	rp.FilterDescendantsInstances = { stump }
-
-	local hit = Workspace:Raycast(origin, direction, rp)
-	if hit then
-		return hit.Position.Y
-	end
-
-	-- Fallback to simple top plane if raycast missed
-	if topPart then
-		return topPart.Position.Y + topPart.Size.Y * 0.5
-	end
-
-	-- Last resort
-	return origin.Y - 10
-end
-
-local function anglesFromDegrees(degVec)
-	return CFrame.Angles(math.rad(degVec.X), math.rad(degVec.Y), math.rad(degVec.Z))
-end
-
--- Build a CFrame whose bottom sits exactly on the stump top at the chosen XZ
-local function buildSurfaceLockedCF(stump, itemModel)
-	local yawDegrees = ADD_RANDOM_YAW and math.random(0, 359) or 0
-	local baseYaw = CFrame.Angles(0, math.rad(yawDegrees), 0)
-
-	-- decide XZ center
-	local marker = findStumpMarker(stump)
-	local cx, cz
-	if marker and marker:IsA("Attachment") then
-		cx, cz = marker.WorldPosition.X, marker.WorldPosition.Z
-	else
-		local tp = getStumpTopPart(stump)
-		if tp then
-			cx, cz = tp.Position.X, tp.Position.Z
-		else
-			local stumpCF = stump:IsA("Model") and select(1, stump:GetBoundingBox()) or stump.CFrame
-			cx, cz = stumpCF.Position.X, stumpCF.Position.Z
-		end
-	end
-
-	-- rotate the item first to get correct world height
-	local itemCFForSize = CFrame.new(0, 0, 0) * baseYaw
-	local _, itemSize = itemModel:GetBoundingBox()
-	-- yaw does not change Y size, but future per-item rotations might. Apply them here virtually:
-	local extraRot = ITEM_ROTATIONS[itemModel.Name]
-	if extraRot then
-		itemCFForSize = itemCFForSize * anglesFromDegrees(extraRot)
-	end
-	-- We cannot query size after virtual rotation without moving the instance,
-	-- but yaw keeps Y extent unchanged. Extra rotations are small; we will still surface-lock via raycast Y.
-
-	local topY = raycastTopY(stump, cx, cz)
-	local targetY = topY + (itemSize.Y * 0.5) + CLEARANCE_Y
-
-	local cf = CFrame.new(Vector3.new(cx, targetY, cz)) * baseYaw
-	-- apply per-item rotation and offset
-	if extraRot then
-		cf = cf * anglesFromDegrees(extraRot)
-	end
-	local off = ITEM_OFFSETS[itemModel.Name]
-	if off then
-		cf = cf * CFrame.new(off)
-	end
-	return cf
-end
-
--- Check overlap at a proposed placement
-local function isOverlappingAtCF(targetCF, itemModel, ignoreList)
-	local _, size = itemModel:GetBoundingBox()
-	local hits = Workspace:GetPartBoundsInBox(targetCF, size, makeOverlapParams(ignoreList))
-	return (#hits > 0)
-end
-
--- Small safety lift only if intersecting with non-stump parts
-local function safePivotTo(clone, baseCF, stump)
-	local ignoreList = { clone, stump, Workspace.Terrain }
-
-	local cf = baseCF
-	for _ = 1, MAX_LIFT_TRIES do
-		if not isOverlappingAtCF(cf, clone, ignoreList) then
-			clone:PivotTo(cf)
-			return true
-		end
-		cf = cf + Vector3.new(0, LIFT_STEP, 0)
-	end
-	clone:PivotTo(cf)
-	warn(("Pickup %s placed but may still be intersecting after max lifts"):format(clone.Name))
-	return false
-end
-
--- Place a specific item on a stump with all rules
-local function placePickupOnStump(itemName, stump)
-	local src = PICKUPS_SOURCE:FindFirstChild(itemName)
-	if not src then
-		warn(("PickUp %s not found under ReplicatedStorage.PickUps"):format(itemName))
-		return
-	end
-
-	local clone = src:Clone()
-	clone.Parent = DEST_FOLDER
-
-	if clone:IsA("Model") then ensurePrimaryPart(clone) end
-
-	local targetCF = buildSurfaceLockedCF(stump, clone)
-	safePivotTo(clone, targetCF, stump)
-end
-
-local function pickNonKeyOutcome()
-	local roll = math.random(1, 100)
-	for _, r in ipairs(NON_KEY_RANGES) do
-		if roll >= r.low and roll <= r.high then
-			return r.name
-		end
+local function pickNonKey()
+	local r = math.random(1, 100)
+	for _, w in ipairs(NON_KEY_RANGES) do
+		if r >= w.low and r <= w.high then return w.name end
 	end
 	return "None"
 end
-
----------------------------------------------------------------------
--- Key selection and spawning flow
----------------------------------------------------------------------
 
 local function shuffle(a)
 	for i = #a, 2, -1 do
 		local j = math.random(1, i)
 		a[i], a[j] = a[j], a[i]
 	end
-	return a
 end
 
-local function chooseKeyStumps(allStumps, keysToPlace)
-	local filtered = {}
+local function chooseKeyStumps(allStumps, keysWanted)
+	local a = {}
 	for _, s in ipairs(allStumps) do
 		if s:IsA("Model") or s:IsA("BasePart") then
-			table.insert(filtered, s)
+			table.insert(a, s)
 		end
 	end
-	if #filtered == 0 then return {}, {} end
-	shuffle(filtered)
-	local nKeys = math.clamp(keysToPlace, 0, #filtered)
-	local keyStumps, otherStumps = {}, {}
-	for i, stump in ipairs(filtered) do
-		if i <= nKeys then
-			table.insert(keyStumps, stump)
+	shuffle(a)
+	local keyStumps, others = {}, {}
+	local nKeys = math.clamp(keysWanted, 0, #a)
+	for i, s in ipairs(a) do
+		if i <= nKeys then table.insert(keyStumps, s) else table.insert(others, s) end
+	end
+	return keyStumps, others
+end
+
+-- ---------------- DE-DUP MECHANICS ----------------
+local function existingPickupsNearStump(stump)
+	local tp = topPartOfStump(stump)
+	if not tp then return {} end
+	local center = CFrame.new(tp.Position + Vector3.new(0, tp.Size.Y * 0.5 + 2, 0))
+	local extents = Vector3.new(6, 8, 6)
+
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { stump, Workspace.Terrain }
+
+	local hits = Workspace:GetPartBoundsInBox(center, extents, params)
+	local models, seen = {}, {}
+	for _, part in ipairs(hits) do
+		local m = part:FindFirstAncestorOfClass("Model")
+		if m and not seen[m] and PICKUP_NAMES[m.Name] then
+			seen[m] = true
+			table.insert(models, m)
+		end
+	end
+	return models
+end
+
+local function dedupeAfterSpawn(stump, keepName)
+	local list = existingPickupsNearStump(stump)
+	if #list <= 1 then return 0 end
+
+	local keep = nil
+	for _, m in ipairs(list) do
+		if m:GetAttribute("SpawnedBy") == SPAWNER_ID and m.Name == keepName then
+			keep = m; break
+		end
+	end
+	keep = keep or list[1]
+
+	local removed = 0
+	for _, m in ipairs(list) do
+		if m ~= keep then
+			removed += 1
+			LOG("De-dup removed extra pickup:", m.Name, "on stump", stump:GetFullName())
+			m:Destroy()
+		end
+	end
+	return removed
+end
+
+-- ---------------- PICKUP EFFECTS ----------------
+local function waitBackpack(plr)
+	local deadline = os.clock() + 3
+	local bp = plr:FindFirstChildOfClass("Backpack")
+	while not bp and os.clock() < deadline do
+		task.wait()
+		bp = plr:FindFirstChildOfClass("Backpack")
+	end
+	return bp
+end
+
+-- counts matching Tools in Backpack and Character
+local function countTools(plr, toolName)
+	local n = 0
+	local function scan(container)
+		if not container then return end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and t.Name == toolName then
+				n += 1
+			end
+		end
+	end
+	scan(waitBackpack(plr))
+	scan(plr.Character)
+	return n
+end
+
+-- giveTool supports duplicates via maxCopies
+-- set maxCopies = 1 for unique Tools like Key
+-- set maxCopies = big number for stackable tools like Bandages
+local function giveTool(plr, toolName, maxCopies)
+	maxCopies = maxCopies or math.huge
+	local bp = waitBackpack(plr)
+	if not bp then
+		WARN("No backpack for", plr.Name, "so", toolName, "not given")
+		return false
+	end
+
+	local have = countTools(plr, toolName)
+	if have >= maxCopies then
+		LOG("Cap reached for", toolName, "have", have, "max", maxCopies, "->", plr.Name)
+		return true
+	end
+
+	local t = Instance.new("Tool")
+	t.Name = toolName
+	t.RequiresHandle = false
+	t.CanBeDropped = false
+
+	-- set the icon before parenting so the default toolbar shows it immediately
+	local id = getIconIdByName(toolName)
+	if id then
+		t.TextureId = id
+	end
+
+	t.Parent = bp
+	LOG("Gave tool", toolName, "to", plr.Name, "(now", have + 1 .. ")")
+	return true
+end
+
+local function findBatteryNumberValue(plr)
+	local function scan(container)
+		if not container then return nil end
+		for _, t in ipairs(container:GetChildren()) do
+			if t:IsA("Tool") and (t.Name == "FlashLight" or t.Name == "Flashlight") then
+				local n = t:FindFirstChild("BatteryValue") or t:FindFirstChild("Battery") or t:FindFirstChild("BatteryPercent")
+				if n and n:IsA("NumberValue") then return n end
+			end
+		end
+	end
+	local char = plr.Character
+	return scan(char) or scan(plr:FindFirstChildOfClass("Backpack"))
+end
+
+local function applyPickupEffect(worldModel, itemName, plr)
+	if itemName == "Key" then
+		if giveTool(plr, "Key", 1) then
+			worldModel:Destroy()
+		end
+	elseif itemName == "Bandages" then
+		if giveTool(plr, "Bandages", 99) then
+			worldModel:Destroy()
+		end
+	elseif itemName == "9Volt" then
+		local batt = findBatteryNumberValue(plr)
+		if batt then
+			local before = batt.Value or 0
+			batt.Value = math.clamp(before + 20, 0, 100)
+			LOG("9Volt used by", plr.Name, "Battery:", before, "->", batt.Value)
+			worldModel:Destroy()
 		else
-			table.insert(otherStumps, stump)
+			LOG("9Volt not consumed (no Battery NumberValue found) for", plr.Name)
 		end
-	end
-	return keyStumps, otherStumps
-end
-
----------------------------------------------------------------------
--- Main
----------------------------------------------------------------------
-
-local KEYS_TO_PLACE = 5
-local placedKeys = 0
-
--- Snapshot current stumps
-local initialStumps = STUMPS_FOLDER:GetChildren()
-local keyStumps, otherStumps = chooseKeyStumps(initialStumps, KEYS_TO_PLACE)
-
--- Place Keys first
-for _, stump in ipairs(keyStumps) do
-	placePickupOnStump("Key", stump)
-	placedKeys += 1
-end
-
--- Then roll on the rest
-for _, stump in ipairs(otherStumps) do
-	local outcome = pickNonKeyOutcome()
-	if outcome ~= "None" then
-		placePickupOnStump(outcome, stump)
+	elseif itemName == "Ammo" then
+		AddAmmoHUD:FireClient(plr, 3)
+		LOG("Ammo +3 HUD for", plr.Name)
+		worldModel:Destroy()
 	end
 end
 
--- Handle stumps added later
-STUMPS_FOLDER.ChildAdded:Connect(function(child)
-	task.wait(0.1)
-	if placedKeys < KEYS_TO_PLACE then
-		placePickupOnStump("Key", child)
-		placedKeys += 1
+local function createPrompt(host)
+	local part = host:IsA("Model") and (host.PrimaryPart or host:FindFirstChildWhichIsA("BasePart", true)) or host
+	if not part then return nil end
+	local p = part:FindFirstChildOfClass("ProximityPrompt") or Instance.new("ProximityPrompt")
+	p.Name = "PickupPrompt"
+	p.ActionText = "Pick up"
+	p.KeyboardKeyCode = Enum.KeyCode.E
+	p.HoldDuration = 0.6
+	p.RequiresLineOfSight = false
+	p.MaxActivationDistance = 8
+	p.Parent = part
+	return p
+end
+
+-- ---------------- SPAWN PIPELINE ----------------
+local function spawnOne(itemName, stump)
+	local exist = existingPickupsNearStump(stump)
+	if #exist > 0 then
+		local names = {}
+		for _, m in ipairs(exist) do table.insert(names, m.Name) end
+		LOG("SKIP spawn on stump (already present):", table.concat(names, ","), " at ", stump:GetFullName())
 		return
 	end
-	local outcome = pickNonKeyOutcome()
-	if outcome ~= "None" then
-		placePickupOnStump(outcome, child)
+
+	local src = PICKUPS_SOURCE:FindFirstChild(itemName)
+	if not src then WARN("PickUps missing model:", itemName); return end
+
+	local m = src:Clone()
+	m.Name = itemName
+	m:SetAttribute("SpawnedBy", SPAWNER_ID)
+	m.Parent = Workspace
+
+	placeOnTop(stump, m)
+	LOG("Spawned", itemName, "on stump", stump:GetFullName())
+
+	local removed = dedupeAfterSpawn(stump, itemName)
+	if removed > 0 then
+		LOG("Post-spawn de-dup removed", removed, "extras on stump", stump:GetFullName())
+	end
+
+	local prompt = createPrompt(m)
+	if not prompt then WARN("No prompt host on spawned model", itemName); return end
+	prompt.ObjectText = itemName
+	prompt.Triggered:Connect(function(plr)
+		if not prompt.Enabled then return end
+		prompt.Enabled = false
+		LOG("Pickup triggered:", itemName, "by", plr.Name)
+		applyPickupEffect(m, itemName, plr)
+		if m and m.Parent then
+			prompt.Enabled = true
+		end
+	end)
+end
+
+-- ---------------- INITIAL & FUTURE STUMPS ----------------
+local all = STUMPS_FOLDER:GetChildren()
+local keyStumps, others = chooseKeyStumps(all, KEYS_TO_PLACE)
+LOG("Initial stumps:", #all, "Keys target:", KEYS_TO_PLACE, "Chosen keys:", #keyStumps, "Others:", #others)
+
+for _, s in ipairs(keyStumps) do spawnOne("Key", s) end
+for _, s in ipairs(others) do
+	local n = pickNonKey()
+	if n ~= "None" then spawnOne(n, s) end
+end
+
+local placedKeys = #keyStumps
+STUMPS_FOLDER.ChildAdded:Connect(function(stump)
+	task.wait(0.1)
+	if placedKeys < KEYS_TO_PLACE then
+		LOG("New stump -> placing Key")
+		spawnOne("Key", stump)
+		placedKeys += 1
+	else
+		local n = pickNonKey()
+		LOG("New stump -> placing", n)
+		if n ~= "None" then spawnOne(n, stump) end
 	end
 end)

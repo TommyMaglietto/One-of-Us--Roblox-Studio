@@ -1,0 +1,127 @@
+-- ServerScriptService/ToolIconEnforcer.server.lua
+-- Forces Tool.TextureId to the matching asset in ReplicatedStorage.ToolIcons
+
+local Players = game:GetService("Players")
+local RS      = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+
+local ICON_FOLDER_NAME = "ToolIcons"
+local IconsFolder = RS:WaitForChild(ICON_FOLDER_NAME)  -- ReplicatedStorage/ToolIcons
+
+-- turn any value into a proper asset URL
+local function normalizeAssetId(v)
+	if v == nil then return nil end
+	if typeof(v) == "number" then
+		return "rbxassetid://" .. tostring(v)
+	end
+	if typeof(v) == "string" then
+		if v == "" then return nil end
+		if v:match("^%d+$") then
+			return "rbxassetid://" .. v
+		end
+		return v
+	end
+	return nil
+end
+
+-- read Image/Texture/Value depending on the object type
+local function extractIconId(iconObj)
+	if not iconObj then return nil end
+	if iconObj:IsA("ImageLabel") or iconObj:IsA("ImageButton") then
+		return normalizeAssetId(iconObj.Image)
+	elseif iconObj:IsA("Decal") or iconObj:IsA("Texture") then
+		return normalizeAssetId(iconObj.Texture)
+	elseif iconObj:IsA("StringValue") then
+		return normalizeAssetId(iconObj.Value)
+	elseif iconObj:IsA("IntValue") or iconObj:IsA("NumberValue") then
+		return normalizeAssetId(iconObj.Value)
+	end
+	return nil
+end
+
+-- find the matching icon object for a tool
+local function findIconObjectForTool(tool)
+	-- exact name first
+	local obj = IconsFolder:FindFirstChild(tool.Name)
+	if obj then return obj end
+	-- support names like "Plank x3" or "Shotgun [Ammo: 2]"
+	local base = tool.Name:match("^(%w+)")
+	if base then
+		return IconsFolder:FindFirstChild(base)
+	end
+	return nil
+end
+
+local function applyIcon(tool)
+	if not tool or not tool:IsA("Tool") then return end
+	local iconObj = findIconObjectForTool(tool)
+	if not iconObj then return end
+	local id = extractIconId(iconObj)
+	if not id then return end
+	if tool.TextureId ~= id then
+		tool.TextureId = id
+	end
+end
+
+local function watchContainer(container)
+	-- apply to existing tools
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Tool") then
+			applyIcon(child)
+			child:GetPropertyChangedSignal("Name"):Connect(function()
+				applyIcon(child)
+			end)
+		end
+	end
+	-- apply to future tools
+	container.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") then
+			applyIcon(child)
+			child:GetPropertyChangedSignal("Name"):Connect(function()
+				applyIcon(child)
+			end)
+		end
+	end)
+end
+
+-- enforce on tool templates so clones already have the right TextureId
+local function watchTemplates(folder)
+	if not folder then return end
+	for _, t in ipairs(folder:GetChildren()) do
+		if t:IsA("Tool") then
+			applyIcon(t)
+		end
+	end
+	folder.ChildAdded:Connect(function(t)
+		if t:IsA("Tool") then
+			applyIcon(t)
+		end
+	end)
+end
+
+-- StarterPack contents
+watchTemplates(StarterPack)
+
+-- ReplicatedStorage tool templates, matching your screenshot folder "Tools"
+watchTemplates(RS:FindFirstChild("Tools"))
+
+-- per-player Backpack and Character
+Players.PlayerAdded:Connect(function(plr)
+	local backpack = plr:WaitForChild("Backpack")
+	watchContainer(backpack)
+	plr.CharacterAdded:Connect(function(char)
+		watchContainer(char)
+	end)
+end)
+
+-- also catch any players already in the server during a hot reload
+for _, plr in ipairs(Players:GetPlayers()) do
+	local backpack = plr:FindFirstChildOfClass("Backpack") or plr:WaitForChild("Backpack")
+	watchContainer(backpack)
+	if plr.Character then
+		watchContainer(plr.Character)
+	end
+	plr.CharacterAdded:Connect(function(char)
+		watchContainer(char)
+	end)
+end
